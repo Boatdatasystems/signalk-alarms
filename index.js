@@ -236,6 +236,29 @@ module.exports = function (app) {
       });
     });
 
+    // Bulk live meta.zones for every known path in one request -- backs the
+    // global Refresh/Send-to-server actions (see CLAUDE.md "Two-state
+    // model: Server vs. Profile"), which need to compare Server against
+    // Profile for the whole list at once rather than one GET /live-meta
+    // call per path. Reuses the exact same bulk-tree-walk approach as
+    // /values below (confirmed in an earlier session: the tree node shape
+    // is {value, $source, timestamp, meta}, so .meta.zones is already
+    // sitting right there in the same tree /values already walks) instead
+    // of calling app.getSelfPath() once per path.
+    router.get('/live-zones', (req, res) => {
+      const tree = app.getPath('vessels.' + app.selfId) || {};
+      const paths = app.streambundle.getAvailablePaths();
+      const zonesByPath = {};
+      paths.forEach((path) => {
+        if (!path) return;
+        const node = path
+          .split('.')
+          .reduce((obj, key) => (obj && typeof obj === 'object' ? obj[key] : undefined), tree);
+        zonesByPath[path] = node && node.meta && Array.isArray(node.meta.zones) ? node.meta.zones : null;
+      });
+      res.json(zonesByPath);
+    });
+
     router.get('/values', (req, res) => {
       const tree = app.getPath('vessels.' + app.selfId) || {};
       const paths = app.streambundle.getAvailablePaths();

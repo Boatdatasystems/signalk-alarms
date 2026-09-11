@@ -341,4 +341,69 @@ Verified: zero browser console messages, zero new `signalk.service` log errors.
 session's frontend-only fixes) and came back healthy immediately.
 
 ---
+
+**Retire draft layer for auto-saving Profile; add global Refresh and Send-to-server**
+
+Asked for: implement the "Two-state model: Server vs. Profile" decided in CLAUDE.md but not
+yet built. Two independent pieces -- don't conflate them.
+
+Part 1: retire the draft layer, auto-save edits straight into Profile.
+```
+draftZones/zonesToDraft/emptyDraftZone -> editableZones/zonesToRows/emptyZoneRow (renamed,
+  all "draft" language removed -- there's no draft concept left)
+lower/upper text input -> 600ms debounce -> POST /persist-zone (reused as-is, no new route)
+state dropdown / Remove -> save immediately, no debounce (discrete actions)
+Get live: confirmed still Server -> Profile via the same /persist-zone call, unchanged
+Commit: confirmed Profile -> Server only, reusing /commit-zone unchanged
+```
+Debounce closure captures `path` and the specific `editableZones` array by value at schedule
+time, not read live from the mutable variable at fire time -- otherwise switching rows before a
+pending save fires would silently apply a stale row's edits to whatever's expanded when the
+timer goes off.
+
+Part 2/3: global Refresh (read-only) and Send-to-server (write, confirmed).
+```
+new GET /live-zones -- bulk meta.zones for every path in one request, reusing /values' own
+  tree-walk pattern (not N calls to /live-meta)
+comparison: order-independent deep equality, each zone -> state|lower|upper|message key,
+  multiset match
+Refresh -> marks mismatched rows (collapsed + expanded) with a "≠ server" badge, writes nothing
+Send to server -> re-checks fresh at click time, custom in-page Confirm/Cancel (not a native
+  confirm() -- consistent with the rest of the app, and a real dialog would've blocked the
+  browser-automation tools used to verify this), zero mismatches shows "No changes to send."
+```
+
+Found, not assumed: the comparison's `message` field revealed that the editable-rows
+conversion functions never round-tripped `message` at all (no UI for it). Under the old
+draft-based design that only mattered on an explicit Commit click; under auto-save, ANY edit
+now re-saves the whole row, so a message set by something else would vanish on the next
+keystroke and Refresh would show that path as permanently mismatched with no way to clear it
+through the UI. Fixed by carrying `message` through untouched even with no input for it.
+
+Flagged as asked, not silently merged: the two parts don't share any route/helper-level code
+(Part 1 only touches the already-existing `/persist-zone`; Part 2/3 only add `/live-zones` and
+frontend comparison logic) -- the one real link is that Send-to-server and Commit both clear a
+resolved path from the mismatch-badge set on success, a small UX addition riding on
+information already available from a single-path operation, not a planned dependency.
+
+Verified end-to-end, scratch server first then the Pi: typed an edit, watched autosave, checked
+`GET /config` directly (not just the browser) that it persisted, reloaded the page fully and
+confirmed the row showed the edited value on re-expand. Injected a live-only mismatch via WS
+delta, ran Refresh, confirmed only that path got badged. Ran Send to server, confirmed the
+count, confirmed, then re-ran Refresh and got zero differences. Confirmed the zero-mismatch
+case shows a clean message with no confirm step.
+
+On the Pi specifically: Refresh's first run also caught three of Paddy's own real, currently
+mismatched paths (`electrical.batteries.lifepo4.cellVoltage.1`, `electrical.other.esp32.vcc`,
+`propulsion.head.temperature`) -- genuine pre-existing drift, not introduced this session.
+Deliberately excluded them from any Send-to-server push (that would mean deciding on Paddy's
+behalf that Profile should overwrite whatever's actually alarming on his boat); used Get Live
+on each instead (pure read from Server, writes nothing) to resolve them non-destructively
+first, then ran the real Send-to-server test against an isolated `test.test` mismatch only.
+
+Verified: zero browser console messages, zero new `signalk.service` log errors on either
+server. `signalk.service` needed one restart on the Pi (backend changed) and came back healthy
+immediately.
+
+---
 *Appended as sessions complete and results come back.*

@@ -98,24 +98,44 @@ Two stores, kept separate:
   decision), so `zones` and `sounds` are linked only by path + state at runtime, not by any
   direct reference between the two stores.
 
-## Stored state vs. live: sync philosophy — decided
+## SUPERSEDED — see "Two-state model: Server vs. Profile" below
 
-General principle: the plugin's stored state (`profiles`) should generally track live server
-reality, not silently drift from it. Two deliberate exceptions where local state does NOT
-auto-follow live:
-- **A row with in-progress edits** — an open draft (typed-but-not-committed values) is never
-  overwritten except by an explicit action on that same row (its own "Get live" click, or
-  discarding it). Commit remains the only thing that pushes a draft OUT to the live server;
-  nothing pushes automatically in that direction.
-- **A freshly-loaded (switched-to) profile** — loading a profile is itself an explicit choice
-  to represent that profile's own stored values; it shouldn't be immediately overwritten by
-  whatever happens to be live, which may reflect a different profile that was previously
-  active.
-This is why per-row "Get live" now writes through to stored state (see "Tab 1 — Zones" below)
-rather than staying draft-only as originally designed — a deliberate, explicit,
-single-path instance of "pull live into stored." A separate **global** "sync all paths from
-live" action is also wanted, still undecided/unbuilt — see "Not yet decided" below, since a
-bulk version needs its own confirmation step given the much larger blast radius.
+<!-- old sync-philosophy section retired here; kept as a marker only, content removed to
+     avoid contradicting the two-state model -->
+
+## Two-state model: Server vs. Profile — decided (supersedes the earlier draft-based design)
+
+Two states only, not three — the earlier "draft" layer (unsaved, in-browser-only edits) is
+retired entirely. **Implemented and verified — see "Current status".**
+- **Server** — live `meta.zones`, the real boat, evaluated by SignalK core.
+- **Profile** — our own persisted config (`profiles.Default.zones`). Auto-saves continuously
+  as you edit (add/remove/change a zone in a row) — debounced (600ms) for the lower/upper text
+  inputs, immediate for discrete actions (state dropdown, Remove) — not a write per keystroke.
+  No separate unsaved-draft state to lose or discard — the existing Save/Save-as
+  profile-snapshot mechanism (see "App structure") is meant to be the only "undo point", not a
+  per-row cancel.
+
+Four actions, each a one-directional move between exactly two of {Server, Profile, the
+on-screen row}:
+- **Editing a row** → auto-saves into Profile. Immediate (debounced), no explicit save step.
+- **Get live** (per-row) → Server → Profile, one path. Reads live `meta.zones`, writes it
+  straight into Profile (and the visible row) — never touches Server.
+- **Commit** (per-row) → Profile → Server, one path. Profile already auto-saves, so Commit's
+  job is just "push Profile's current value for this path to Server" — it does still also
+  re-persist Profile as a side effect of reusing `/commit-zone`, but that's a harmless no-op
+  re-save of data that's already there, not something the UI needs to think about separately.
+- **Refresh** (global) → reads Server for every path in one bulk request, compares each
+  against Profile, marks any row where they differ (`≠ server` badge, amber) on its
+  thumbnail — including collapsed rows, since the point is a whole-list-at-a-glance scan. Pure
+  read — writes nothing anywhere.
+- **Send to server** (global) → Profile → Server, for every path Refresh identified as
+  differing. Confirms first with a count only ("Send N changed paths to the server" — no full
+  path list needed, a custom in-page confirm/cancel rather than a native `confirm()` dialog).
+  Re-checks the diff at send time rather than trusting a possibly-stale earlier Refresh click.
+
+Get Live/Send-to-server are the same direction (Server→Profile) at row-scope vs. all-scope;
+Commit/Send-to-server are the same direction (Profile→Server) at row-scope vs. all-scope.
+Refresh is the only pure-read action, safe to run anytime.
 
 ## Tab 1 — Zones: editor UI decided
 
@@ -623,16 +643,96 @@ bulk version needs its own confirmation step given the much larger blast radius.
     required one restart (backend `index.js` changed this session, unlike the previous
     session's frontend-only fixes) and came back healthy immediately, same as every prior
     restart in this project.
+- **Two-state model implemented: draft layer retired, Profile auto-saves, global Refresh and
+  Send-to-server added.** Two independent pieces of work, kept genuinely separate except where
+  noted below.
+  - **Part 1 — auto-saving Profile.** `draftZones`/`zonesToDraft`/`emptyDraftZone` renamed to
+    `editableZones`/`zonesToRows`/`emptyZoneRow` and all "draft" framing removed from
+    comments — there's no draft concept left, `editableZones` is just the on-screen editable
+    view of Profile for whichever row is expanded. Editing (lower/upper text inputs) debounces
+    600ms before calling `POST /persist-zone` (the exact route built last session for "Get
+    live"'s persist step, reused as-is — no new backend route needed for this part); the state
+    dropdown and Remove save immediately, no debounce, since they're discrete actions with no
+    "pause in typing" to wait for. **Debounce choice, stated explicitly as asked:** 600ms —
+    long enough that a normal typing burst (e.g. "123") collapses into one save, short enough
+    that switching rows or hitting Commit right after typing doesn't leave an edit stranded for
+    long. The debounce closure captures `path` and the specific `editableZones` array instance
+    at schedule time rather than reading the mutable module-level variable at fire time — matters
+    because switching rows before a pending timer fires reassigns that variable, and reading it
+    live from inside the timeout would silently apply a stale row's edits to whatever path
+    happens to be expanded when the timer goes off.
+  - Get Live: confirmed still Server → Profile via the same `/persist-zone` call from last
+    session, only variable names/comments changed. Commit: confirmed Profile → Server only,
+    reusing `/commit-zone` unchanged — it does still also re-persist Profile as a side effect
+    of that route, which is a harmless no-op re-save under the auto-save model, not a "save"
+    Commit itself needs to perform.
+  - **Part 2/3 — global Refresh (read-only) and Send-to-server (write, confirmed).** New
+    backend route `GET /live-zones` bulk-fetches every known path's live `meta.zones` in one
+    request, reusing the exact same tree-walk `/values` already does (not `getSelfPath()` once
+    per path) — extended the existing bulk-endpoint *pattern*, not the `/values` route itself,
+    to avoid touching an endpoint other code already depends on for path-type filtering.
+    **Comparison approach, stated explicitly as asked:** order-independent deep equality — each
+    zone reduces to a `state|lower|upper|message` key, two arrays match if they contain the
+    same multiset of keys regardless of order. Handles duplicate identical zone entries
+    correctly (both sides need the same count of that key), though that's an unlikely real
+    case, not something hit in testing.
+  - **Real edge case the comparison surfaced, not obvious going in:** `zoneKey` treats
+    `message` as part of a zone's identity, but the editable-rows conversion functions had
+    never round-tripped `message` at all (there's no UI for it, never asked for one). Under the
+    old draft-based design that only mattered if someone clicked Commit; under auto-save, *any*
+    edit — typing in a different zone's bound, changing a state dropdown — now re-saves the
+    whole row on every change, so a message set by something other than this UI would vanish on
+    the very next keystroke, and Refresh would then show that path as permanently "differs from
+    server" with no way to clear it through the UI. Fixed by carrying `message` through
+    `zonesToRows`/`editableRowsToZones` untouched even with no input for it — flagged here since
+    it's exactly the kind of "didn't cleanly reuse existing helpers" divergence the prompt asked
+    about, though the divergence was in the frontend's row-conversion functions, not in
+    `persistZonesForPath()`/`normalizeZones()` themselves (both reused unchanged).
+  - Send-to-server's confirmation is a custom in-page Confirm/Cancel pair, not a native
+    `confirm()` — chosen partly for UI consistency (nothing else in this app uses native
+    dialogs) and partly because a real native dialog would have blocked the browser-automation
+    tools used to verify it. Zero mismatches: shows "No changes to send." instead of the
+    confirm step, rather than disabling the button pre-emptively off a possibly-stale count.
+  - **Entanglement between the two parts, flagged as asked rather than silently merged:** none
+    at the route/helper level — Part 1 only touches `/persist-zone` (already existing), Part
+    2/3 only add `/live-zones` and frontend comparison logic, `persistZonesForPath()`/
+    `normalizeZones()` untouched by both. The one real link is conceptual: Send-to-server and
+    Commit both remove a path from `mismatchedPaths` on success (so a just-resolved row's badge
+    disappears immediately rather than waiting for the next Refresh), which means Part 2/3's
+    badge state is quietly informed by Part 1/Commit's actions — mentioned since it wasn't
+    asked for outright, it was a small UX addition built on top of already having the
+    information from a single-path operation's own result.
+  - Verified end-to-end, scratch server first then the Pi: typed a lower-bound edit, watched
+    "Saved" appear, confirmed via `GET /config` (not just the browser) that it persisted, then
+    did a full page reload and confirmed the row showed the edited value on re-expand without
+    touching Commit. Manually created a live/Profile mismatch (WS meta injection on a path
+    Profile had nothing for), clicked Refresh, confirmed only that path got the `≠ server`
+    badge (collapsed and expanded) while others didn't. Clicked Send to server, confirmed the
+    count matched, confirmed, then re-ran Refresh and confirmed zero differences remained.
+    Confirmed the zero-mismatch case shows "No changes to send." without a confirm step.
+  - **On the Pi specifically:** found `electrical.batteries.lifepo4.cellVoltage.1` (Paddy's own
+    real, in-progress battery zone editing) and two other real paths
+    (`electrical.other.esp32.vcc`, `propulsion.head.temperature`) genuinely mismatched against
+    Server when Refresh first ran — real pre-existing drift, not something this session
+    introduced. Deliberately did NOT include them in any Send-to-server push, since that would
+    mean deciding on Paddy's behalf that his current Profile values should overwrite whatever's
+    actually alarming on his boat right now. Used Get Live on each instead (pure read from
+    Server, writes nothing to it) to bring Profile back in sync with reality first, then ran
+    the actual Send-to-server test against an isolated `test.test` mismatch only. Cleaned up
+    `test.test` back to empty afterward; left Paddy's three real paths exactly as their own
+    live Server state already had them.
+  - Zero browser console messages, zero new `signalk.service` log errors on either server;
+    `signalk.service` required one restart on the Pi (backend `index.js` changed) and came back
+    healthy immediately, same PID throughout the rest of testing.
 
 ## Not yet decided / next session
 
 - Anchor alarm is no longer special-cased for profile auto-switching — it's just one
   notification path among all the others on Tab 2, same as everything else. Profile
   switching is manual only for now unless we revisit an auto-switch trigger later.
-- **Global bulk "sync all paths from live" button** — wanted, not yet built. Needs its own
-  confirmation step (much larger blast radius than the per-row version — touches every path's
-  stored data in one action) and writes straight to the stored profile, no per-path draft step.
-- **Live alarm-state "instant glance" dots on thumbnails** — a separate idea from the bulk
-  sync button above (notification *state*, e.g. reading `notifications.<path>` live, rather
-  than zone *bounds*). Not yet decided whether this is still wanted alongside or instead of the
-  bulk sync button — revisit.
+- **Live alarm-state "instant glance" dots on thumbnails** — a separate idea from the
+  "Two-state model"'s Refresh/Send-to-server (notification *state*, e.g. reading
+  `notifications.<path>` live, rather than zone *bounds* matching/mismatching). The two-state
+  model itself is now built (see "Current status"), so this is ripe to revisit, but still not
+  decided whether it's wanted alongside or instead of the `≠ server` badge — deliberately not
+  decided this session either, per its own explicit constraints.

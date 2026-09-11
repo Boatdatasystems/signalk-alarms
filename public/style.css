@@ -292,3 +292,91 @@ body {
 .commit-status-pending { color: #666; }
 .commit-status-success { color: #2e7d32; }
 .commit-status-error { color: #c62828; }
+
+.commit-status-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed #ddd;
+}
+
+.autosave-status {
+  margin-left: 0.75rem;
+  font-size: 0.8rem;
+}
+
+.autosave-status-pending { color: #666; }
+.autosave-status-success { color: #2e7d32; }
+.autosave-status-error { color: #c62828; }
+
+.mismatch-badge {
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 10px;
+  background: #fff3cd;
+  color: #8a6512;
+  border: 1px solid #ffe69c;
+  flex-shrink: 0;
+}
+
+.global-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  flex-wrap: wrap;
+}
+
+.refresh-btn,
+.send-btn {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid #22303c;
+  border-radius: 4px;
+  background: #fff;
+  color: #22303c;
+  cursor: pointer;
+}
+
+.send-btn {
+  background: #22303c;
+  color: #fff;
+}
+
+.refresh-btn:disabled,
+.send-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.send-confirm-text {
+  font-size: 0.85rem;
+}
+
+.send-confirm-btn,
+.send-cancel-btn {
+  font-size: 0.85rem;
+  padding: 0.4rem 0.9rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.send-confirm-btn {
+  border: 1px solid #c62828;
+  background: #c62828;
+  color: #fff;
+}
+
+.send-cancel-btn {
+  border: 1px solid #ccc;
+  background: #fff;
+  color: #333;
+}
+
+.refresh-status,
+.send-status {
+  font-size: 0.85rem;
+}
+
+.refresh-status-pending, .send-status-checking { color: #666; }
+.refresh-status-success, .send-status-success, .send-status-none { color: #2e7d32; }
+.refresh-status-error, .send-status-error { color: #c62828; }
