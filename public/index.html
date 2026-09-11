@@ -23,7 +23,15 @@
 
   <main>
     <section id="tab-zones" class="tab-panel active">
-      <p class="placeholder">Zone editor coming soon.</p>
+      <div class="filter-bar">
+        <input type="text" id="zones-search" placeholder="Search paths..." />
+        <select id="zones-source-filter">
+          <option value="">All sources</option>
+        </select>
+      </div>
+      <div id="zones-list" class="path-list">
+        <p class="placeholder">Loading paths...</p>
+      </div>
     </section>
     <section id="tab-notifications" class="tab-panel">
       <p class="placeholder">Notification sound bindings coming soon.</p>

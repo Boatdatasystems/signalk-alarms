@@ -117,6 +117,19 @@ Two stores, kept separate:
   live system and the active profile's in-memory state; naming/persisting an actual profile
   is still the **global** action described in "App structure" above — a profile is a full
   snapshot of every zone here plus every sound binding on Tab 2, not just one path's zones.
+- **"Get live" button, per row (decided):** the mirror of Commit, reversed direction — pulls
+  whatever zone configuration is *actually* currently governing that path's live alarm state
+  (the path's SignalK `meta.zones`, regardless of who set it — us, `@signalk/zones`' own
+  admin UI, or something configured before this plugin existed) into the row's local,
+  uncommitted editor state, overwriting whatever's there. Exists because our own `profiles`
+  store and the live system can genuinely drift — first-time import of pre-existing zones, or
+  reconciling after an out-of-band edit. No confirmation prompt needed for uncommitted local
+  edits it overwrites — nothing's live until Commit anyway.
+- **Not yet verified:** the exact server-side mechanism for reading a path's current live
+  `meta.zones` — candidates are a plugin-API method (`app.getMetadata()` or similar) versus
+  the REST meta endpoint (`/signalk/v1/api/vessels/self/<path>/meta`). Verify against the
+  actual signalk-server source before implementing, same discipline as the keyword/config-path
+  checks from the scaffold session — don't assume from training data.
 - **Decided:** range is user-configurable per path, not fixed — no hardcoded scale table.
   Needs a stored min/max per path, kept per-path rather than per-profile (the same path keeps
   the same track scale across profiles, since it's a display/editing concern, not a
@@ -208,9 +221,83 @@ Two stores, kept separate:
 - Restart `signalk.service` (systemd) to pick up changes.
 - SignalK server on this Pi: confirmed v2.31.1, Node v22.23.2 (server recommends v24 but
   runs fine on 22).
+- **Plugin-detection keyword is `signalk-node-server-plugin`, not `signalk-plugin`.** Verified
+  against signalk-server 2.32.0 source (`modulesWithKeyword()` in `src/interfaces/plugins.ts`)
+  during the scaffold build, and independently confirmed against the official SignalK plugin
+  dev docs' own example `package.json`. `signalk-webapp` (webapp keyword) was already correct.
+- **Plugin config persists to a single JSON file, not a directory:**
+  `~/.signalk/plugin-config-data/signalk-alarms.json`, via the server's `pluginConfigPath()`.
+  Corrects an earlier assumption in this doc's history that it was a `signalk-alarms/`
+  directory — doesn't affect our code since we only ever call
+  `app.savePluginOptions()`/`readPluginOptions()`, but matters if anything ever inspects the
+  file directly.
+- **`app.savePluginOptions(x)` does NOT overwrite the config file with `x`.** Confirmed against
+  signalk-server source (`appCopy.savePluginOptions` in `src/interfaces/plugins.ts`): it calls
+  `savePluginOptions(pluginId, { ...getPluginOptions(pluginId), configuration: x }, cb)` — i.e.
+  it wraps whatever you pass under a `configuration` key, merged onto the file's *existing*
+  top-level contents (`enabled`, etc). An earlier version of `index.js` called
+  `app.readPluginOptions()` (the full `{enabled, configuration}` envelope) and passed the
+  whole thing back into `savePluginOptions()`, which nested one level deeper under
+  `configuration` on every single plugin restart — caught during this session's verification
+  when the scratch config file showed doubled nesting after two restarts. **Fix:** `start()`'s
+  own `options` argument (or `app.readPluginOptions().configuration`) IS our data blob
+  directly — read/write that, never the full envelope. Same applies front-end side: `GET
+  /plugins/signalk-alarms/config` returns the full envelope, so the webapp reads
+  `config.configuration.pathSettings` / `config.configuration.profiles`, not
+  `config.pathSettings` directly.
+- **Custom HTTP routes:** `plugin.registerWithRouter = function(router) { router.get(...) }`.
+  Confirmed against signalk-server source (`doRegisterPlugin` in `src/interfaces/plugins.ts`):
+  the server calls `plugin.registerWithRouter(asPluginRouter(app, router, plugin.id))` and then
+  mounts that router at `/plugins/<pluginId>/`, so a route registered as `router.get('/paths',
+  ...)` is reachable at `/plugins/signalk-alarms/paths`. `asPluginRouter` just adds an optional
+  `.access(level)` permission-scoping helper on top of a normal Express router — calling
+  `.get()` etc. directly without `.access()` still works for routes that don't need special
+  permissioning (ours doesn't).
 
-## Not yet decided / next session
+## Current status
 
+- Initial plugin skeleton built and verified: `package.json` (zero dependencies), `index.js`
+  (plugin lifecycle + `pathSettings`/`profiles` persistence), and the two-tab static webapp
+  shell (profile bar, working tab-switch JS).
+- `index.js` now seeds `profiles` as `{ "Default": { zones: {}, sounds: {} } }` on first run
+  (when persisted `profiles` is empty) instead of `{}` — the scaffold session's flagged gap is
+  closed, and the webapp's hardcoded "Default" profile-bar option now corresponds to a real
+  stored profile.
+- Backend now exposes `GET /plugins/signalk-alarms/paths` (via `plugin.registerWithRouter`),
+  returning `app.streambundle.getAvailablePaths()` as JSON — see the route-registration gotcha
+  above.
+- Tab 1 (Zones) is now a working list/filter/accordion shell: text search + a source `<select>`
+  populated dynamically from the distinct top-level segments of whatever `/paths` actually
+  returns (no hardcoded option list), rows expand accordion-style (one open at a time) showing
+  a static, non-interactive colored zone bar read from `profiles["Default"].zones[path]`. No
+  drag interaction, live value marker, or real Commit yet — those are still follow-up work.
+  Notifications tab untouched.
+- Verified end-to-end against a scratch local signalk-server 2.32.0 install, symlinked in
+  (mirrors the deploy pattern above, not npm-installed): loads with correct keywords/schema,
+  starts cleanly, persists config in the correct (non-nesting) shape across restarts, `/paths`
+  returns real data, the Zones tab's search/source filter both genuinely narrow that real data,
+  accordion single-open behavior confirmed, no server-log or browser-console errors. Nothing
+  touched on the actual Pi for this.
+- Local git repo initialized under `github.com/Boatdatasystems/signalk-alarms`, pushed to
+  `main`.
+- **Open, not yet decided:**
+  - Where/how a path's display range (`pathSettings[path].min/max`) actually gets set — no UI
+    exists for this yet. The Zones tab's static zone bar currently auto-fits its scale to the
+    zone entries' own `lower`/`upper` bounds when zones exist (virtually never right now, since
+    `Default` seeds with empty `zones`), which is a display-only stopgap, not the real editor
+    scale from the "Tab 1 — Zones" section above.
+  - The Zones tab's path list excludes `notifications.*` paths entirely (those belong to Tab 2)
+    and excludes the single empty-string path `getAvailablePaths()` returns (appears to be a
+    root/context artifact, not a real leaf path) — but does NOT otherwise filter by value type,
+    so string- or object-valued paths (e.g. `navigation.position`) currently show up in the
+    Zones list even though they can't plausibly host a numeric zone. `getAvailablePaths()`
+    returns path strings only, no type info, and adding per-path value lookups to determine
+    type felt out of scope for a static list/filter shell — revisit when Commit/real zone
+    writing exists and a bad-path-type error actually matters.
+  - Zone-state color palette in the Zones tab (`nominal`=green, `alert`=yellow, `warn`=orange,
+    `alarm`=red, `emergency`=purple) is my own placeholder choice, not verified against Kip's
+    actual gauge-zone palette referenced in "Tab 1 — Zones: editor UI decided" above — cosmetic,
+    easy to change later.
 - Anchor alarm is no longer special-cased for profile auto-switching — it's just one
   notification path among all the others on Tab 2, same as everything else. Profile
   switching is manual only for now unless we revisit an auto-switch trigger later.
