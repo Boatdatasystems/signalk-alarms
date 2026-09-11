@@ -153,9 +153,11 @@ Two stores, kept separate:
   `zones` for exactly the paths most likely to have them — a trap, avoided by using
   `app.getSelfPath()` instead. Exposed to the webapp via `GET
   /plugins/signalk-alarms/live-meta?path=<path>` (our own route, not a SignalK-standard one).
-  Read-only preview of this is built (see "Current status"); the full behavior described in the
-  previous bullet — pulling live zones into the row's *uncommitted editor state* — still needs
-  the actual drag editor to exist first.
+  **Closed:** "Get live" now does exactly what the previous bullet describes — overwrites the
+  row's editable zone list with the path's live `meta.zones`, uncommitted and freely
+  overwritable, no confirmation needed. Didn't need the drag editor to exist first after all;
+  numeric inputs (this session's editable zone *list*, not the single-zone placeholder from
+  two sessions ago) were enough of an "uncommitted editor state" to pull into.
 - **Decided:** range is user-configurable per path, not fixed — no hardcoded scale table.
   Needs a stored min/max per path, kept per-path rather than per-profile (the same path keeps
   the same track scale across profiles, since it's a display/editing concern, not a
@@ -235,6 +237,13 @@ Two stores, kept separate:
   be a red herring (it's an extremely common, mostly-benign GTK3 warning seen across many
   unrelated apps). Mentioned here only as a reminder: verify the actual failure mode via logs
   before committing to a theory, even a plausible one.
+- **A full re-render on every live-value WebSocket tick (~1/sec on a streaming path) tore out
+  input focus and dropped keystrokes** from the Commit form's numeric inputs — caught only by
+  actually trying to type into the UI while data streamed, not by any automated check. Fixed
+  by updating just the value readout element in place instead of re-rendering the row. Same
+  category as the accordion-toolbar scoping bug from an earlier session: a naive full-redraw
+  works fine until something else on the page needs to hold state (focus, in this case)
+  across ticks.
 - **`zones-edit`/`@signalk/zones` and SignalK core's own native zone watcher can BOTH fire
   for the same crossing** — two `notifications.<path>` deltas with identical state/message
   but different ids. Root cause: `zones-edit` evaluates from its own persisted config and, as
@@ -242,7 +251,10 @@ Two stores, kept separate:
   present since at least 2.31.1, the Pi's exact version) picks up independently and evaluates
   AGAIN. Real, currently-live risk on any server running both — if the Pi's `zones-edit`
   plugin already has any zones configured, they may already be double-notifying, unrelated to
-  anything this project built. Worth checking directly, not assumed either way.
+  anything this project built. Worth checking directly, not assumed either way. **Checked on
+  the Pi specifically:** `zones-edit` is installed but disabled with an empty config — the
+  double-fire risk there was theoretical, not live, at the time of checking. Re-enabling it
+  with any zones configured would reintroduce the risk.
 - **Useful but unused finding:** the server itself exposes `POST /plugins/<id>/config` for
   ANY plugin (a route the server registers generically, not something each plugin defines) —
   posting `{enabled, configuration}` there saves the config file and automatically
@@ -309,6 +321,14 @@ Two stores, kept separate:
   app.selfId)` directly — confirmed `app.selfId` is real by round-tripping it through a
   temporary debug header before removing it. Caught while building the `/values` bulk-fetch
   endpoint, which initially came back empty.
+
+- **The Pi's SignalK server has security/authentication enabled, and plugin routes inherit
+  it.** Discovered during deployment — `signalk-generate-token` (over SSH) was needed rather
+  than a password prompt. **Confirmed, not just assumed:** this plugin's own routes (e.g.
+  `commit-zone`) 401 without auth, same as every other server route — the webapp itself works
+  fine through a browser already logged into the SignalK admin UI (normal session cookie);
+  scripted/API verification used `signalk-generate-token -u <user> -e 1h -s security.json`
+  (run over SSH) to mint a short-lived token without ever touching the actual password.
 
 ## Current status
 
@@ -479,12 +499,60 @@ Two stores, kept separate:
     than quietly fixing it and moving on, since it's evidence of a previous session's real,
     unfinished touch on live boat hardware — worth knowing about even though the immediate
     effect was benign.
+    **Resolved:** Paddy confirmed this was his own manual testing, not an untracked session
+    touching real hardware — no further concern.
   - Confirmed `signalk.service` healthy after all of the above: `active (running)`, same PID as
     right after the restart (no crash/respawn during testing), no new errors in the journal
     beyond the three already-known pre-existing benign ones (`signalk-notification-player`'s
     missing-festival message, occasional mDNS `ENETUNREACH`, and version-check `fetch failed` —
     all present immediately after a clean restart too, unrelated to this plugin). Node-RED and
     other existing consumers reconnected normally post-restart per the service log.
+- **Multi-zone editing per path; pre-population fixed.** Paddy found two real usability gaps
+  using the deployed Pi webapp itself. Both reproduced directly against the Pi before fixing,
+  per usual practice here:
+  - **"Can only set 1 zone at a time" — confirmed a real single-entry limitation, not a UI
+    glitch.** The old editor had one scalar lower/upper/state triple per row; the backend
+    `commit-zone` route already accepted a full zones array (no backend change needed), but the
+    frontend only ever sent a 1-element array, and `configuration.profiles.Default.zones[path]
+    = cleanZones` (and the matching `meta.zones` write) fully REPLACES rather than merges —
+    confirmed by committing a warn zone then an alarm zone on the same path via the old
+    single-input flow and watching the warn zone vanish. **Fixed:** `draftZones` is now an
+    array; the row shows one lower/upper/state/Remove group per zone, an "Add zone" button
+    appends another, Commit sends the whole array. Verified live on the Pi: committed a warn
+    band (0–50) and a separate alarm band (lower: 50) on `test.test` together, confirmed both
+    persisted in the stored profile AND `meta.zones`, then fed WS deltas (25, then 75) and got
+    the correct `warn` then `alarm` notification for each, a single stable notification id
+    throughout (no double-fire).
+  - **"Live update doesn't seem to work, lower/upper stay blank" — determined which of the two
+    plausible causes it actually was, not assumed.** Reproduced on the Pi: the live *value*
+    readout was working correctly the whole time (watched it tick 3.332 → 3.329 on a real
+    battery path, and 250 → 75 on a WS-driven test path, both live and correct). The actual bug
+    was that the lower/upper/state *editor inputs* always reset to blank/`alarm` on every row
+    expand, regardless of what was already stored for that path — confirmed by expanding
+    `electrical.batteries.lifepo4.cellVoltage.1` (Paddy's own real, already-committed
+    `{alert, 3.3–3.55}` zone) and seeing empty inputs and the hardcoded `alarm` default instead.
+    **Fixed:** row expand now calls `zonesToDraft(defaultProfileZones[path])` to seed the
+    editable list from stored data instead of resetting it blank; re-verified on the same real
+    row afterward — inputs now show `3.3`, `3.55`, `alert` correctly.
+  - Also closes the "Get live" loop flagged in CLAUDE.md's Tab 1 section two sessions ago:
+    clicking it now overwrites the same editable `draftZones` list with the path's actual live
+    `meta.zones` (still uncommitted, still freely overwritable, no confirmation) — not just the
+    read-only bar display it was limited to before. Verified by manually injecting a live-only
+    zone (`{state: emergency, lower: 90}`, distinct from the stored warn/alarm pair) via a raw
+    WS meta delta and confirming "Get live" replaced the draft list with that single row.
+  - **New environment nuance, not a bug:** live browser testing against the Pi required an
+    authenticated session (see the security/auth gotcha from two sessions ago); since I don't
+    have and shouldn't handle Paddy's actual login, I patched `window.fetch`/`WebSocket` in the
+    page's own JS context to attach a `signalk-generate-token`-issued JWT, then called
+    `loadZonesTab()` again to reload through the patched calls — same technique as the
+    SSH-based token approach already documented, just applied inside the browser instead of via
+    curl. This is a testing workaround for driving the deployed UI without a password prompt,
+    not a change to the plugin itself — the plugin still relies on the normal browser session
+    cookie for any real logged-in user, same as before.
+  - Verified: zero browser console messages and zero new `signalk.service` log errors across
+    reproduction, fixing, and re-verification; `signalk.service` stayed on the same PID
+    throughout (no restart needed — `index.js`/backend was untouched, only `public/app.js` and
+    `public/style.css` changed, both static files).
 
 ## Not yet decided / next session
 

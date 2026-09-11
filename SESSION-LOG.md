@@ -236,4 +236,59 @@ immediately after a clean restart too, unrelated to this plugin. Node-RED and ot
 reconnected normally post-restart.
 
 ---
+
+**Multi-zone editing per path; fix reported blank-input bug**
+
+Asked for: fix two usability gaps Paddy found using the actual deployed Pi webapp, not the
+scratch server -- reproduce both directly first, don't assume the cause from the description.
+
+```
+1. "Can only set 1 zone at a time"
+2. "Live update doesn't seem to work, lower and upper text boxes remain blank"
+```
+
+Reproduced both against the Pi before touching code:
+1. Committed a warn zone, then an alarm zone, on the same path via the old single-input flow --
+   the warn zone vanished from both the stored profile and `meta.zones`. Confirmed: the old
+   editor could only ever send a 1-element zones array, and the backend write is a full
+   replace, not a merge. The backend route already accepted a full array; this was purely a
+   frontend gap.
+2. Expanded a row with an existing real committed zone
+   (`electrical.batteries.lifepo4.cellVoltage.1`, Paddy's own `{alert, 3.3-3.55}`) and watched
+   the lower/upper stay blank and the state dropdown show the hardcoded "alarm" default. The
+   live *value* readout on the same row was working fine the whole time (watched it tick on two
+   different real/test paths) -- the bug was specifically that the zone editor's inputs never
+   read from stored (or live) data on expand, always reset blank. Stated this distinction
+   explicitly before fixing, per what was asked.
+
+Fixed:
+```
+draftZones: array, one {lower, upper, state} per row, not a single scalar triple
+row expand -> zonesToDraft(defaultProfileZones[path]) seeds the list from stored data
+Get live -> also overwrites draftZones with live meta.zones (closes a loop flagged 2 sessions ago)
+Commit -> sends the whole draftZones array, blank rows skipped silently
+```
+
+Flagged, not silently worked around: testing the real deployed UI in a browser needed an
+authenticated session (the Pi has security enabled, confirmed two sessions ago) -- rather than
+touching Paddy's actual login, patched `window.fetch`/`WebSocket` inside the page's own JS
+console to attach a `signalk-generate-token`-issued JWT (same token-generation approach as
+before, just applied in-browser instead of via curl), then re-invoked the page's own
+`loadZonesTab()`. Testing-only; the plugin itself still relies on the normal browser session
+cookie, unchanged.
+
+Verified end-to-end on the actual Pi: committed a warn band (0-50) and an alarm band (lower:50)
+together on `test.test`, confirmed both persisted in the stored profile and `meta.zones`, then
+drove WS deltas (25, then 75) and got the correct `warn` then `alarm` notification for each with
+one stable notification id (no double-fire). Re-expanded the real battery-voltage row and
+confirmed the inputs now show `3.3`/`3.55`/`alert` instead of blank. Injected a live-only zone
+via a raw WS meta delta and confirmed "Get live" replaced the draft list with it. Cleaned up
+`test.test`'s zone data afterward (it's disposable test scaffolding, per two sessions ago) --
+left Paddy's real battery zone untouched throughout, only viewed it, never re-committed it.
+
+Verified: zero browser console messages, zero new `signalk.service` log errors,
+`signalk.service` stayed on the same PID (no restart needed -- only static frontend files
+changed).
+
+---
 *Appended as sessions complete and results come back.*

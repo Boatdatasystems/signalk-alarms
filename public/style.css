@@ -220,10 +220,38 @@ body {
   border-top: 1px dashed #ddd;
 }
 
+.draft-zones-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
 .commit-inputs {
   display: flex;
   gap: 0.5rem;
   align-items: center;
+}
+
+.remove-zone-btn {
+  font-size: 0.8rem;
+  padding: 0.3rem 0.6rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  color: #c62828;
+  cursor: pointer;
+}
+
+.add-zone-btn {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.8rem;
+  border: 1px dashed #999;
+  border-radius: 4px;
+  background: #fff;
+  color: #333;
+  cursor: pointer;
+  margin-right: 0.5rem;
 }
 
 .commit-inputs input[type="number"] {

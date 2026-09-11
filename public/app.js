@@ -42,10 +42,27 @@ let liveValueError = null;
 // Commit draft state: only relevant for whichever row is expanded, same
 // single-active-row pattern as liveZones/liveValue above. Plain numeric
 // inputs, not drag -- that's deliberately deferred to a later session.
-let draftLower = '';
-let draftUpper = '';
-let draftState = 'alarm';
+// A path's real zones are an array (a warn band and a separate alarm band
+// on the same path is normal), so the draft is a list, not a single triple.
+let draftZones = [];
 let commitStatus = null; // {type: 'pending'|'success'|'error', message}
+
+function emptyDraftZone() {
+  return { lower: '', upper: '', state: 'alarm' };
+}
+
+// Converts a stored/live zones array (numbers, per the meta.zones shape)
+// into the editable draft shape (strings, one per input). An empty/missing
+// input starts the editor with one blank row rather than nothing, so
+// there's always something to type into without an extra "Add zone" click.
+function zonesToDraft(zones) {
+  if (!zones || zones.length === 0) return [emptyDraftZone()];
+  return zones.map((z) => ({
+    lower: typeof z.lower === 'number' ? String(z.lower) : '',
+    upper: typeof z.upper === 'number' ? String(z.upper) : '',
+    state: z.state || 'alarm'
+  }));
+}
 
 function pathSource(path) {
   return path.split('.')[0];
@@ -225,9 +242,12 @@ function renderZonesList() {
       expandedPath = expandedPath === path ? null : path;
       liveZones = undefined;
       liveFetchError = null;
-      draftLower = '';
-      draftUpper = '';
-      draftState = 'alarm';
+      // Pre-populate from stored data rather than starting blank -- the
+      // editor previously always reset to empty regardless of what was
+      // already committed for this path, which read as "live update doesn't
+      // work" even though the bug was really in the zone inputs, not the
+      // live value readout (that part was already working correctly).
+      draftZones = zonesToDraft(defaultProfileZones[path]);
       commitStatus = null;
       closeLiveValueSocket();
       if (expandedPath) {
@@ -264,6 +284,10 @@ function renderZonesList() {
           .then((data) => {
             liveZones = data.zones;
             liveFetchError = null;
+            // Per the "Get live" decision in CLAUDE.md: overwrites the
+            // editable list too, uncommitted and freely overwritable, no
+            // confirmation needed -- nothing's live until Commit anyway.
+            draftZones = zonesToDraft(data.zones);
             renderZonesList();
           })
           .catch((err) => {
@@ -295,47 +319,84 @@ function renderZonesList() {
       fillLiveValueReadout(valueReadout);
       body.appendChild(valueReadout);
 
-      // Real Commit: plain numeric inputs (lower/upper/state), not drag --
-      // that's deliberately deferred. Posts to our own backend, which writes
-      // meta.zones directly (server core's own native zone watcher does the
-      // actual enforcement -- see CLAUDE.md "Architecture"/"Data model")
-      // and updates the Default profile's stored zones[path] to match.
+      // Real Commit: an editable LIST of zones (lower/upper/state per row),
+      // not drag -- that's deliberately deferred. A real path typically
+      // needs more than one zone (a warn band and a separate alarm band on
+      // the same path is normal), so this is the actual meta.zones array
+      // shape, not a single-zone placeholder. Posts to our own backend,
+      // which writes meta.zones directly (server core's own native zone
+      // watcher does the actual enforcement -- see CLAUDE.md
+      // "Architecture"/"Data model") and updates the Default profile's
+      // stored zones[path] to match.
       const commitSection = document.createElement('div');
       commitSection.className = 'commit-section';
 
-      const inputsRow = document.createElement('div');
-      inputsRow.className = 'commit-inputs';
+      const draftListEl = document.createElement('div');
+      draftListEl.className = 'draft-zones-list';
 
-      const lowerInput = document.createElement('input');
-      lowerInput.type = 'number';
-      lowerInput.placeholder = 'Lower (blank = unbounded)';
-      lowerInput.value = draftLower;
-      lowerInput.addEventListener('input', () => {
-        draftLower = lowerInput.value;
+      draftZones.forEach((zone, idx) => {
+        const zoneRow = document.createElement('div');
+        zoneRow.className = 'commit-inputs';
+
+        const lowerInput = document.createElement('input');
+        lowerInput.type = 'number';
+        lowerInput.placeholder = 'Lower (blank = unbounded)';
+        lowerInput.value = zone.lower;
+        lowerInput.addEventListener('input', () => {
+          draftZones[idx].lower = lowerInput.value;
+        });
+
+        const upperInput = document.createElement('input');
+        upperInput.type = 'number';
+        upperInput.placeholder = 'Upper (blank = unbounded)';
+        upperInput.value = zone.upper;
+        upperInput.addEventListener('input', () => {
+          draftZones[idx].upper = upperInput.value;
+        });
+
+        const stateSelect = document.createElement('select');
+        // "normal" is @signalk/zones'/server core's own implicit fallback
+        // for an undefined gap between zones, never a state to set
+        // explicitly -- see CLAUDE.md "Tab 1 — Zones: editor UI decided".
+        ['nominal', 'alert', 'warn', 'alarm', 'emergency'].forEach((s) => {
+          const opt = document.createElement('option');
+          opt.value = s;
+          opt.textContent = s;
+          if (s === zone.state) opt.selected = true;
+          stateSelect.appendChild(opt);
+        });
+        stateSelect.addEventListener('change', () => {
+          draftZones[idx].state = stateSelect.value;
+        });
+
+        const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
+        removeBtn.className = 'remove-zone-btn';
+        removeBtn.textContent = 'Remove';
+        removeBtn.title = 'Remove this zone from the draft';
+        removeBtn.addEventListener('click', () => {
+          draftZones.splice(idx, 1);
+          renderZonesList();
+        });
+
+        zoneRow.appendChild(lowerInput);
+        zoneRow.appendChild(upperInput);
+        zoneRow.appendChild(stateSelect);
+        zoneRow.appendChild(removeBtn);
+        draftListEl.appendChild(zoneRow);
       });
 
-      const upperInput = document.createElement('input');
-      upperInput.type = 'number';
-      upperInput.placeholder = 'Upper (blank = unbounded)';
-      upperInput.value = draftUpper;
-      upperInput.addEventListener('input', () => {
-        draftUpper = upperInput.value;
-      });
+      commitSection.appendChild(draftListEl);
 
-      const stateSelect = document.createElement('select');
-      // "normal" is @signalk/zones'/server core's own implicit fallback for
-      // an undefined gap between zones, never a state to set explicitly --
-      // see CLAUDE.md "Tab 1 — Zones: editor UI decided".
-      ['nominal', 'alert', 'warn', 'alarm', 'emergency'].forEach((s) => {
-        const opt = document.createElement('option');
-        opt.value = s;
-        opt.textContent = s;
-        if (s === draftState) opt.selected = true;
-        stateSelect.appendChild(opt);
+      const addZoneBtn = document.createElement('button');
+      addZoneBtn.type = 'button';
+      addZoneBtn.className = 'add-zone-btn';
+      addZoneBtn.textContent = 'Add zone';
+      addZoneBtn.addEventListener('click', () => {
+        draftZones.push(emptyDraftZone());
+        renderZonesList();
       });
-      stateSelect.addEventListener('change', () => {
-        draftState = stateSelect.value;
-      });
+      commitSection.appendChild(addZoneBtn);
 
       const commitBtn = document.createElement('button');
       commitBtn.type = 'button';
@@ -343,12 +404,20 @@ function renderZonesList() {
       commitBtn.textContent = 'Commit';
       commitBtn.disabled = !!(commitStatus && commitStatus.type === 'pending');
       commitBtn.addEventListener('click', () => {
-        const lowerText = draftLower.trim();
-        const upperText = draftUpper.trim();
-        const lower = lowerText === '' ? undefined : Number(lowerText);
-        const upper = upperText === '' ? undefined : Number(upperText);
-        if (lower === undefined && upper === undefined) {
-          commitStatus = { type: 'error', message: 'Set at least a lower or upper bound.' };
+        const zonesToSend = [];
+        for (const zone of draftZones) {
+          const lowerText = zone.lower.trim();
+          const upperText = zone.upper.trim();
+          const lower = lowerText === '' ? undefined : Number(lowerText);
+          const upper = upperText === '' ? undefined : Number(upperText);
+          // A row left fully blank (e.g. an unused "Add zone" row) is just
+          // not-yet-used, not an error -- skip it silently rather than
+          // rejecting the whole commit over it.
+          if (lower === undefined && upper === undefined) continue;
+          zonesToSend.push({ lower: lower, upper: upper, state: zone.state });
+        }
+        if (zonesToSend.length === 0) {
+          commitStatus = { type: 'error', message: 'Add at least one zone with a lower or upper bound.' };
           renderZonesList();
           return;
         }
@@ -357,12 +426,15 @@ function renderZonesList() {
         fetch('/plugins/signalk-alarms/commit-zone', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ path: path, zones: [{ lower: lower, upper: upper, state: draftState }] })
+          body: JSON.stringify({ path: path, zones: zonesToSend })
         })
           .then((r) => r.json().then((data) => ({ ok: r.ok, data: data })))
           .then(({ ok, data }) => {
             if (!ok) throw new Error(data.error || 'Commit failed');
             defaultProfileZones[path] = data.zones;
+            // Refresh the draft from what the server actually stored (its
+            // cleaned/normalized form), same as a fresh expand would show.
+            draftZones = zonesToDraft(data.zones);
             commitStatus = { type: 'success', message: 'Committed — live now.' };
             renderZonesList();
           })
@@ -371,12 +443,7 @@ function renderZonesList() {
             renderZonesList();
           });
       });
-
-      inputsRow.appendChild(lowerInput);
-      inputsRow.appendChild(upperInput);
-      inputsRow.appendChild(stateSelect);
-      inputsRow.appendChild(commitBtn);
-      commitSection.appendChild(inputsRow);
+      commitSection.appendChild(commitBtn);
 
       if (commitStatus) {
         const statusEl = document.createElement('div');
