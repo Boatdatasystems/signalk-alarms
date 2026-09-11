@@ -213,3 +213,54 @@ body {
   color: #333;
   font-family: monospace;
 }
+
+.commit-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed #ddd;
+}
+
+.commit-inputs {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.commit-inputs input[type="number"] {
+  width: 9rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.commit-inputs select {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.commit-btn {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #22303c;
+  border-radius: 4px;
+  background: #22303c;
+  color: #fff;
+  cursor: pointer;
+}
+
+.commit-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.commit-status {
+  margin-top: 0.4rem;
+  font-size: 0.8rem;
+}
+
+.commit-status-pending { color: #666; }
+.commit-status-success { color: #2e7d32; }
+.commit-status-error { color: #c62828; }

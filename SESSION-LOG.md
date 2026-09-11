@@ -153,4 +153,87 @@ alive at any time, never left dangling. Zero browser console messages, zero serv
 across the whole session.
 
 ---
+
+**Verify @signalk/zones enforcement mechanism + minimal real Commit**
+
+Asked for (three sequential parts, gated on each other): (1) confirm directly against a real
+running server whether `@signalk/zones` enforces from its own persisted config or from `meta`,
+and find the clean way to update another plugin's config if needed; (2) build a real, working
+Commit — plain numeric inputs, not drag — using whatever Part 1 confirms, proven end-to-end
+against a scratch server including a real notification firing on a real boundary crossing;
+(3) deploy to the Pi carefully, only once Part 2 is fully proven locally.
+
+Part 1 result — bigger and different than the prompt anticipated:
+```
+zones-edit (the actual installed plugin id for @signalk/zones) does read options.zones once at
+start(), as assumed. But: signalk-server core itself unconditionally instantiates a native
+Zones class at startup (dist/zones.js, `new Zones(app.streambundle, ...)` in dist/index.js)
+that watches meta.zones on EVERY path and fires real notifications independent of any plugin.
+Confirmed on both a fresh 2.32.0 install and a separately-installed 2.31.1 (the Pi's exact
+version) -- not assumed to carry over between versions.
+```
+Consequence found, not asked for but couldn't ignore: running zones-edit's own config-based
+path double-fires notifications (two distinct notification `id`s for one crossing) because
+zones-edit's own meta side-effect gets picked up a second time by core's independent watcher.
+Reported this back before writing any Commit code, since it invalidates the "reuse
+@signalk/zones" architecture decision rather than just being an implementation detail. Given
+the go-ahead to proceed on direct-meta-write instead, and to check the Pi's existing
+`zones-edit` state first (read-only) -- came back disabled with empty config, not installed in
+node_modules at all, so the double-fire risk is theoretical for this boat, not live.
+
+Part 2 (this entry only covers up through here -- Part 3 continues below as it happens):
+```
+POST /plugins/signalk-alarms/commit-zone {path, zones:[{lower,upper,state}]}
+  -> validate -> app.handleMessage() writes meta.zones -> profiles.Default.zones[path] updated
+Zones tab row: lower/upper number inputs + state <select> + Commit button, plain inputs not drag
+```
+Verified end-to-end against the scratch server, via both direct API calls and the real browser
+UI: committed a zone through the actual Commit button, confirmed a genuine
+`notifications.<path>` delta existed server-side; separately drove WS deltas across a committed
+boundary and watched a real `normal`→`alarm` transition with one stable notification id (no
+double-fire, confirming Part 1's fix holds in practice).
+
+Flagged & fixed against assumption, not just noted (checked real behavior, not memory):
+- The live-value WebSocket handler called a full `renderZonesList()` on every delta. For a
+  streaming path (i.e. the exact kind of path someone sets a real alarm on) that's ~1/sec,
+  tearing down and rebuilding the Commit inputs on every tick and silently eating any
+  in-progress typing. Found by trying to type a lower bound into a streaming row via browser
+  automation and watching the field stay empty despite the type action reporting success --
+  not a hypothetical, an actually-encountered failure. Fixed by updating the value readout's
+  text in place instead of a full re-render; confirmed by typing into a live-streaming row's
+  Lower field and watching it survive several ticks.
+
+Verified: zero server-log errors and no browser console errors surfaced across the scratch
+server work for this session so far.
+
+Part 3 — deployed to the Pi, following the documented pattern exactly (scp, symlink, package.json
+file: entry, systemctl restart). New environment difference from the scratch server: the Pi has
+security enabled, so our own routes need auth like everything else -- used
+`signalk-generate-token` over SSH (documented CLI, reads the username from security.json,
+never touches the actual password) rather than asking for credentials.
+
+Picked `test.test` (pre-existing Node-RED-sourced scaffold path, no zone/notification/consumer
+attached) as the low-stakes test path. Same end-to-end proof as Part 2, this time against the
+real boat: committed a zone via the real Commit mechanism, crossed it with a WS delta, got a
+real `notifications.test.test` alarm delta back from the live server.
+
+Found, not introduced by this session: `electrical.batteries.lifepo4.cellVoltage.1` (a real
+LiFePO4 cell voltage path) already had a stray, mismatched zone -- stored config said
+`{lower:3, upper:3.5}`, live meta said the degenerate `{lower:3, upper:3}` (can never match).
+Evidence an earlier, apparently-interrupted session tested directly against a real battery path
+rather than a synthetic one, before this session's continuation began (the plugin itself wasn't
+even deployed yet when this session started -- confirmed no symlink, no package.json entry --
+but its config file and a stray live meta write had already landed). Currently harmless (the
+degenerate zone can't fire), but real orphaned state on real hardware, flagged rather than
+quietly fixed. Cleaned up: cleared the stray meta (confirmed other meta fields --
+units/alarmMethod -- untouched), removed it from the stored profile, backed up the config file
+first.
+
+Verified: `signalk.service` stayed `active (running)` on the same PID throughout, no new errors
+in the journal beyond three already-known, pre-existing benign ones (missing festival package,
+occasional mDNS ENETUNREACH, version-check fetch failure over no internet) -- all present
+immediately after a clean restart too, unrelated to this plugin. Node-RED and other consumers
+reconnected normally post-restart.
+
+---
 *Appended as sessions complete and results come back.*

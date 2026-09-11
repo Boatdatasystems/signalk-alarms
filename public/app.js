@@ -39,6 +39,14 @@ let liveValueSocket = null;
 let liveValue;
 let liveValueError = null;
 
+// Commit draft state: only relevant for whichever row is expanded, same
+// single-active-row pattern as liveZones/liveValue above. Plain numeric
+// inputs, not drag -- that's deliberately deferred to a later session.
+let draftLower = '';
+let draftUpper = '';
+let draftState = 'alarm';
+let commitStatus = null; // {type: 'pending'|'success'|'error', message}
+
 function pathSource(path) {
   return path.split('.')[0];
 }
@@ -87,7 +95,13 @@ function openLiveValueSocket(path) {
         if (v.path === path) {
           liveValue = v.value;
           liveValueError = null;
-          renderZonesList();
+          // Update the readout text in place rather than a full
+          // renderZonesList(). A streaming path ticks this every ~1s
+          // (the subscription period below) -- a full re-render would tear
+          // down and rebuild every input in the row on each tick, stealing
+          // focus and dropping keystrokes out from under anyone actively
+          // typing into the Commit lower/upper/state inputs just below it.
+          updateLiveValueReadout();
         }
       });
     });
@@ -100,6 +114,18 @@ function openLiveValueSocket(path) {
   });
 
   return ws;
+}
+
+function fillLiveValueReadout(el) {
+  el.classList.toggle('zone-bar-error', !!liveValueError);
+  el.textContent = liveValueError || 'Current value: ' + (liveValue === undefined ? 'no data yet' : formatLiveValue(liveValue));
+}
+
+// In-place update, deliberately not a renderZonesList() call -- see the
+// comment at the call site in the WS message handler above.
+function updateLiveValueReadout() {
+  const el = document.getElementById('live-value-readout');
+  if (el) fillLiveValueReadout(el);
 }
 
 function closeLiveValueSocket() {
@@ -128,16 +154,24 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
   // No stored display range (pathSettings min/max) exists yet for any path —
   // that UI doesn't exist yet. This auto-fits the bar to the zones' own
   // bounds purely so something renders; it is not the real editor scale.
-  const lowest = Math.min(...zones.map((z) => z.lower));
-  const highest = Math.max(...zones.map((z) => z.upper));
+  // A committed zone can legitimately have only one bound set (the other
+  // left unbounded, per the zone schema) -- fall back to the other defined
+  // bound, or a 1-unit span, rather than producing NaN geometry.
+  const lows = zones.map((z) => z.lower).filter((v) => typeof v === 'number');
+  const highs = zones.map((z) => z.upper).filter((v) => typeof v === 'number');
+  const lowest = lows.length ? Math.min(...lows) : highs.length ? Math.min(...highs) - 1 : 0;
+  const highest = highs.length ? Math.max(...highs) : lowest + 1;
   const span = highest - lowest || 1;
 
   zones.forEach((zone) => {
+    const zLower = typeof zone.lower === 'number' ? zone.lower : lowest;
+    const zUpper = typeof zone.upper === 'number' ? zone.upper : highest;
     const seg = document.createElement('div');
     seg.className = 'zone-bar-segment ' + (ZONE_STATE_CLASS[zone.state] || '');
-    seg.style.left = ((zone.lower - lowest) / span) * 100 + '%';
-    seg.style.width = ((zone.upper - zone.lower) / span) * 100 + '%';
-    seg.title = zone.state + ': ' + zone.lower + ' - ' + zone.upper;
+    seg.style.left = ((zLower - lowest) / span) * 100 + '%';
+    seg.style.width = ((zUpper - zLower) / span) * 100 + '%';
+    seg.title =
+      zone.state + ': ' + (typeof zone.lower === 'number' ? zone.lower : '-inf') + ' - ' + (typeof zone.upper === 'number' ? zone.upper : '+inf');
     bar.appendChild(seg);
   });
 
@@ -191,6 +225,10 @@ function renderZonesList() {
       expandedPath = expandedPath === path ? null : path;
       liveZones = undefined;
       liveFetchError = null;
+      draftLower = '';
+      draftUpper = '';
+      draftState = 'alarm';
+      commitStatus = null;
       closeLiveValueSocket();
       if (expandedPath) {
         liveValueSocket = openLiveValueSocket(expandedPath);
@@ -252,15 +290,102 @@ function renderZonesList() {
       }
 
       const valueReadout = document.createElement('div');
+      valueReadout.id = 'live-value-readout';
       valueReadout.className = 'live-value-readout';
-      if (liveValueError) {
-        valueReadout.classList.add('zone-bar-error');
-        valueReadout.textContent = liveValueError;
-      } else {
-        valueReadout.textContent =
-          'Current value: ' + (liveValue === undefined ? 'no data yet' : formatLiveValue(liveValue));
-      }
+      fillLiveValueReadout(valueReadout);
       body.appendChild(valueReadout);
+
+      // Real Commit: plain numeric inputs (lower/upper/state), not drag --
+      // that's deliberately deferred. Posts to our own backend, which writes
+      // meta.zones directly (server core's own native zone watcher does the
+      // actual enforcement -- see CLAUDE.md "Architecture"/"Data model")
+      // and updates the Default profile's stored zones[path] to match.
+      const commitSection = document.createElement('div');
+      commitSection.className = 'commit-section';
+
+      const inputsRow = document.createElement('div');
+      inputsRow.className = 'commit-inputs';
+
+      const lowerInput = document.createElement('input');
+      lowerInput.type = 'number';
+      lowerInput.placeholder = 'Lower (blank = unbounded)';
+      lowerInput.value = draftLower;
+      lowerInput.addEventListener('input', () => {
+        draftLower = lowerInput.value;
+      });
+
+      const upperInput = document.createElement('input');
+      upperInput.type = 'number';
+      upperInput.placeholder = 'Upper (blank = unbounded)';
+      upperInput.value = draftUpper;
+      upperInput.addEventListener('input', () => {
+        draftUpper = upperInput.value;
+      });
+
+      const stateSelect = document.createElement('select');
+      // "normal" is @signalk/zones'/server core's own implicit fallback for
+      // an undefined gap between zones, never a state to set explicitly --
+      // see CLAUDE.md "Tab 1 — Zones: editor UI decided".
+      ['nominal', 'alert', 'warn', 'alarm', 'emergency'].forEach((s) => {
+        const opt = document.createElement('option');
+        opt.value = s;
+        opt.textContent = s;
+        if (s === draftState) opt.selected = true;
+        stateSelect.appendChild(opt);
+      });
+      stateSelect.addEventListener('change', () => {
+        draftState = stateSelect.value;
+      });
+
+      const commitBtn = document.createElement('button');
+      commitBtn.type = 'button';
+      commitBtn.className = 'commit-btn';
+      commitBtn.textContent = 'Commit';
+      commitBtn.disabled = !!(commitStatus && commitStatus.type === 'pending');
+      commitBtn.addEventListener('click', () => {
+        const lowerText = draftLower.trim();
+        const upperText = draftUpper.trim();
+        const lower = lowerText === '' ? undefined : Number(lowerText);
+        const upper = upperText === '' ? undefined : Number(upperText);
+        if (lower === undefined && upper === undefined) {
+          commitStatus = { type: 'error', message: 'Set at least a lower or upper bound.' };
+          renderZonesList();
+          return;
+        }
+        commitStatus = { type: 'pending', message: 'Committing...' };
+        renderZonesList();
+        fetch('/plugins/signalk-alarms/commit-zone', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: path, zones: [{ lower: lower, upper: upper, state: draftState }] })
+        })
+          .then((r) => r.json().then((data) => ({ ok: r.ok, data: data })))
+          .then(({ ok, data }) => {
+            if (!ok) throw new Error(data.error || 'Commit failed');
+            defaultProfileZones[path] = data.zones;
+            commitStatus = { type: 'success', message: 'Committed — live now.' };
+            renderZonesList();
+          })
+          .catch((err) => {
+            commitStatus = { type: 'error', message: err.message };
+            renderZonesList();
+          });
+      });
+
+      inputsRow.appendChild(lowerInput);
+      inputsRow.appendChild(upperInput);
+      inputsRow.appendChild(stateSelect);
+      inputsRow.appendChild(commitBtn);
+      commitSection.appendChild(inputsRow);
+
+      if (commitStatus) {
+        const statusEl = document.createElement('div');
+        statusEl.className = 'commit-status commit-status-' + commitStatus.type;
+        statusEl.textContent = commitStatus.message;
+        commitSection.appendChild(statusEl);
+      }
+
+      body.appendChild(commitSection);
     }
 
     row.appendChild(header);
