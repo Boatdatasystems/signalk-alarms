@@ -55,6 +55,27 @@ module.exports = function (app) {
     router.get('/paths', (req, res) => {
       res.json(app.streambundle.getAvailablePaths());
     });
+
+    // Live meta.zones for a path, straight from the running data model — NOT
+    // the REST /meta endpoint. That endpoint (src/interfaces/rest.js) checks
+    // @signalk/path-metadata's static getMetadata() first, and only falls
+    // through to the live tree for paths that package has no built-in entry
+    // for. Many common paths (e.g. most navigation.*/environment.* paths)
+    // DO have a static entry (units/description), so that endpoint would
+    // return only that and silently omit any real live zones — a false
+    // "no zones" for exactly the paths most likely to have real zones set.
+    // app.getSelfPath() is the documented plugin API for reading anything
+    // from vessels.self in the live model (server_plugin_api docs), so
+    // composing path + '.meta' reads the actual live meta, zones included.
+    router.get('/live-meta', (req, res) => {
+      const path = req.query.path;
+      if (!path) {
+        res.status(400).json({ error: 'path query parameter required' });
+        return;
+      }
+      const meta = app.getSelfPath(path + '.meta');
+      res.json({ zones: (meta && meta.zones) || null });
+    });
   };
 
   return plugin;

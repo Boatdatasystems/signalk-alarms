@@ -24,20 +24,26 @@ let allPaths = [];
 let defaultProfileZones = {};
 let expandedPath = null;
 
+// Only relevant for whichever row is currently expanded (accordion is
+// single-open, so one set of live-view state is enough). undefined = this
+// row hasn't fetched live data yet, still showing stored. null = fetched,
+// server has no live zones for this path. array = fetched live zones.
+let liveZones;
+let liveFetchError = null;
+
 function pathSource(path) {
   return path.split('.')[0];
 }
 
-function buildZoneBar(path, sizeClass) {
+function buildZoneBar(zones, sizeClass, emptyMessage) {
   const bar = document.createElement('div');
   bar.className = 'zone-bar ' + sizeClass;
 
-  const zones = defaultProfileZones[path];
   if (!zones || zones.length === 0) {
     if (sizeClass === 'full') {
       const empty = document.createElement('div');
       empty.className = 'zone-bar-empty';
-      empty.textContent = 'No zones defined for this path yet.';
+      empty.textContent = emptyMessage || 'No zones defined for this path yet.';
       bar.appendChild(empty);
     }
     return bar;
@@ -101,16 +107,70 @@ function renderZonesList() {
 
     header.appendChild(name);
     header.appendChild(badge);
-    header.appendChild(buildZoneBar(path, 'mini'));
+    // Mini preview always reflects stored profile data, regardless of
+    // whether the expanded view below is currently showing a live fetch.
+    header.appendChild(buildZoneBar(defaultProfileZones[path], 'mini'));
 
     header.addEventListener('click', () => {
       expandedPath = expandedPath === path ? null : path;
+      liveZones = undefined;
+      liveFetchError = null;
       renderZonesList();
     });
 
     const body = document.createElement('div');
     body.className = 'path-row-body';
-    body.appendChild(buildZoneBar(path, 'full'));
+
+    // liveZones/liveFetchError are single (not per-path) state — only
+    // meaningful for whichever row is actually expanded, since expanding a
+    // *different* row resets them (see the header click handler above).
+    // Building this content for collapsed rows too would read stale state
+    // that belongs to no particular path.
+    if (path === expandedPath) {
+      const toolbar = document.createElement('div');
+      toolbar.className = 'zone-bar-toolbar';
+
+      const label = document.createElement('span');
+      label.className = 'zone-bar-source-label' + (liveZones !== undefined ? ' live' : '');
+      label.textContent = liveZones !== undefined ? 'Live (from server)' : 'Stored (Default profile)';
+
+      const liveBtn = document.createElement('button');
+      liveBtn.type = 'button';
+      liveBtn.className = 'get-live-btn';
+      liveBtn.textContent = 'Get live';
+      liveBtn.addEventListener('click', () => {
+        liveBtn.disabled = true;
+        liveBtn.textContent = 'Loading...';
+        fetch('/plugins/signalk-alarms/live-meta?path=' + encodeURIComponent(path))
+          .then((r) => r.json())
+          .then((data) => {
+            liveZones = data.zones;
+            liveFetchError = null;
+            renderZonesList();
+          })
+          .catch((err) => {
+            liveFetchError = err.message;
+            renderZonesList();
+          });
+      });
+
+      toolbar.appendChild(label);
+      toolbar.appendChild(liveBtn);
+      body.appendChild(toolbar);
+
+      if (liveFetchError) {
+        const err = document.createElement('div');
+        err.className = 'zone-bar-empty zone-bar-error';
+        err.textContent = 'Failed to fetch live data: ' + liveFetchError;
+        body.appendChild(err);
+      } else if (liveZones !== undefined) {
+        const bar = buildZoneBar(liveZones, 'full', 'No live zones for this path.');
+        bar.classList.add('live');
+        body.appendChild(bar);
+      } else {
+        body.appendChild(buildZoneBar(defaultProfileZones[path], 'full'));
+      }
+    }
 
     row.appendChild(header);
     row.appendChild(body);

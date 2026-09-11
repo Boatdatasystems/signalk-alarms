@@ -163,3 +163,46 @@ body {
 .zone-state-warn { background: #ffa726; }
 .zone-state-alarm { background: #e53935; }
 .zone-state-emergency { background: #8e24aa; }
+
+.zone-bar-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.zone-bar-source-label {
+  font-size: 0.8rem;
+  color: #666;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.zone-bar-source-label.live {
+  color: #1565c0;
+}
+
+.get-live-btn {
+  font-size: 0.8rem;
+  padding: 0.25rem 0.6rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.get-live-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.zone-bar.live {
+  outline: 2px solid #1565c0;
+  outline-offset: 1px;
+}
+
+.zone-bar-error {
+  color: #c62828;
+}

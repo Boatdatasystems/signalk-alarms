@@ -68,7 +68,7 @@ zero browser console messages, zero server-log errors.
 
 ---
 
-**"Get live" preview** — *prompt sent, results not yet reported*
+**"Get live" preview**
 
 Asked for: verify the real mechanism for reading a path's live `meta.zones` against source
 (not assumed); per-row "Get live" button, read-only, shows live zone data distinct from
@@ -79,6 +79,23 @@ stored profile data.
 no live zones → show that plainly, not blank/broken
 ```
 
+Flagged & fixed against assumption (checked real signalk-server source, not memory):
+- The REST meta endpoint (`/signalk/v1/api/vessels/self/<path>/meta`) looked plausible — it's
+  a real, working route — but reading `src/interfaces/rest.js` in the actual installed 2.32.0
+  package showed it checks `@signalk/path-metadata`'s static `getMetadata()` first and only
+  falls through to live data for paths that static package has no entry for. Most common
+  `navigation.*`/`environment.*` paths DO have a static units entry, so that endpoint would
+  have silently returned only static metadata and omitted real live zones on exactly the paths
+  most likely to have them — used `app.getSelfPath(path + '.meta')` instead (documented plugin
+  API method, confirmed against both the installed source and the public ServerAPI docs).
+
+Verified: manually injected a real zone onto `environment.wind.speedApparent` (sent a delta
+with a `meta` array over the server's WebSocket input stream — no REST POST exists for setting
+meta) — "Get live" retrieved and displayed it correctly (three colored segments matching what
+was sent), outlined and labelled "LIVE (FROM SERVER)" in blue. A path with no live zones
+(`navigation.attitude`) showed "No live zones for this path." cleanly, distinct from the
+stored-data empty message. Zero browser console messages, zero server-log errors across the
+whole session.
+
 ---
-*Appended as sessions complete and results come back — entries above the scaffold are
-placeholders until reported.*
+*Appended as sessions complete and results come back.*

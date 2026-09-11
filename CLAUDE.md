@@ -125,11 +125,21 @@ Two stores, kept separate:
   store and the live system can genuinely drift — first-time import of pre-existing zones, or
   reconciling after an out-of-band edit. No confirmation prompt needed for uncommitted local
   edits it overwrites — nothing's live until Commit anyway.
-- **Not yet verified:** the exact server-side mechanism for reading a path's current live
-  `meta.zones` — candidates are a plugin-API method (`app.getMetadata()` or similar) versus
-  the REST meta endpoint (`/signalk/v1/api/vessels/self/<path>/meta`). Verify against the
-  actual signalk-server source before implementing, same discipline as the keyword/config-path
-  checks from the scaffold session — don't assume from training data.
+- **Verified:** reading a path's live `meta.zones` is `app.getSelfPath(path + '.meta')` — a
+  documented plugin API method ("Returns the entry for the provided path starting from
+  `vessels.self` in the full data model", per the ServerAPI docs), composed with `.meta` since
+  that's just a normal sibling key in that model, same as `.value`. Confirmed NOT the REST meta
+  endpoint (`/signalk/v1/api/vessels/self/<path>/meta`): that route (`src/interfaces/rest.js`)
+  checks `@signalk/path-metadata`'s static `getMetadata()` first and only falls through to the
+  live data-model tree for paths that static package has no built-in entry for. Many common
+  paths (most `navigation.*`/`environment.*`) DO have a static units/description entry there,
+  so that endpoint would silently return only the static metadata and omit any real live
+  `zones` for exactly the paths most likely to have them — a trap, avoided by using
+  `app.getSelfPath()` instead. Exposed to the webapp via `GET
+  /plugins/signalk-alarms/live-meta?path=<path>` (our own route, not a SignalK-standard one).
+  Read-only preview of this is built (see "Current status"); the full behavior described in the
+  previous bullet — pulling live zones into the row's *uncommitted editor state* — still needs
+  the actual drag editor to exist first.
 - **Decided:** range is user-configurable per path, not fixed — no hardcoded scale table.
   Needs a stored min/max per path, kept per-path rather than per-profile (the same path keeps
   the same track scale across profiles, since it's a display/editing concern, not a
@@ -298,6 +308,27 @@ Two stores, kept separate:
     `alarm`=red, `emergency`=purple) is my own placeholder choice, not verified against Kip's
     actual gauge-zone palette referenced in "Tab 1 — Zones: editor UI decided" above — cosmetic,
     easy to change later.
+- Each expanded Zones-tab row now has a read-only **"Get live" button** (per the "Tab 1 — Zones"
+  section's "Get live" decision above): fetches `GET
+  /plugins/signalk-alarms/live-meta?path=<path>` (backed by `app.getSelfPath(path + '.meta')`,
+  see that section for why not the REST `/meta` endpoint) and re-renders that row's zone bar
+  from live data instead of `profiles["Default"].zones[path]`, labelled "LIVE (FROM SERVER)"
+  in blue with a matching outline on the bar itself vs. "STORED (DEFAULT PROFILE)" in the
+  default state. A path with no live zones shows "No live zones for this path." distinctly from
+  the stored-empty message ("No zones defined for this path yet."). This is the read-only
+  preview only — not wired into any editor state, since there's no drag editor yet to pull
+  into; that integration is follow-up work once Commit/drag exists.
+  - Verified against a manually-injected real zone (sent a delta with a `meta` array over the
+    server's WebSocket input stream, since the REST API has no POST for setting meta) on
+    `environment.wind.speedApparent`: "Get live" retrieved and rendered it correctly, a
+    zone-less path showed the clean empty state, zero browser console messages, zero
+    server-log errors.
+  - Open, not resolved here: whether "Get live" should appear on every row regardless of path
+    type — currently yes, same as the row itself (ties into the still-open path-type-filtering
+    question above; deliberately not resolving that here per this session's scope).
+
+## Not yet decided / next session
+
 - Anchor alarm is no longer special-cased for profile auto-switching — it's just one
   notification path among all the others on Tab 2, same as everything else. Profile
   switching is manual only for now unless we revisit an auto-switch trigger later.
