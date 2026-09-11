@@ -31,8 +31,84 @@ let expandedPath = null;
 let liveZones;
 let liveFetchError = null;
 
+// Live value marker: one WebSocket subscription for whichever row is
+// expanded, opened on expand and closed on collapse/switch — see the header
+// click handler. liveValue undefined = no reading yet; liveValueError set on
+// socket failure.
+let liveValueSocket = null;
+let liveValue;
+let liveValueError = null;
+
 function pathSource(path) {
   return path.split('.')[0];
+}
+
+function formatLiveValue(value) {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) ? String(value) : value.toFixed(3);
+  }
+  return JSON.stringify(value);
+}
+
+// WS stream at /signalk/v1/stream, subscribe=none on connect so nothing is
+// sent until we explicitly ask for this one path — confirmed against
+// signalk-server source (src/interfaces/ws.js: query.subscribe === 'none'
+// skips the default self-subscription; src/subscriptionmanager.js: a
+// subscribe message is {context, subscribe: [{path, period}]}, context
+// 'vessels.self' matches the own vessel). Deltas arrive as
+// {updates: [{values: [{path, value}]}]} — distinct from the meta deltas
+// used to set zones, which use updates[].meta instead of updates[].values.
+function openLiveValueSocket(path) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + '/signalk/v1/stream?subscribe=none');
+
+  ws.addEventListener('open', () => {
+    ws.send(
+      JSON.stringify({
+        context: 'vessels.self',
+        subscribe: [{ path: path, period: 1000 }]
+      })
+    );
+  });
+
+  ws.addEventListener('message', (evt) => {
+    // Guard against a stale socket's trailing message landing after a
+    // different row has already been expanded.
+    if (path !== expandedPath) return;
+    let msg;
+    try {
+      msg = JSON.parse(evt.data);
+    } catch (e) {
+      return;
+    }
+    if (!msg.updates) return;
+    msg.updates.forEach((update) => {
+      (update.values || []).forEach((v) => {
+        if (v.path === path) {
+          liveValue = v.value;
+          liveValueError = null;
+          renderZonesList();
+        }
+      });
+    });
+  });
+
+  ws.addEventListener('error', () => {
+    if (path !== expandedPath) return;
+    liveValueError = 'Live value subscription failed.';
+    renderZonesList();
+  });
+
+  return ws;
+}
+
+function closeLiveValueSocket() {
+  if (liveValueSocket) {
+    liveValueSocket.close();
+    liveValueSocket = null;
+  }
+  liveValue = undefined;
+  liveValueError = null;
 }
 
 function buildZoneBar(zones, sizeClass, emptyMessage) {
@@ -115,6 +191,10 @@ function renderZonesList() {
       expandedPath = expandedPath === path ? null : path;
       liveZones = undefined;
       liveFetchError = null;
+      closeLiveValueSocket();
+      if (expandedPath) {
+        liveValueSocket = openLiveValueSocket(expandedPath);
+      }
       renderZonesList();
     });
 
@@ -170,6 +250,17 @@ function renderZonesList() {
       } else {
         body.appendChild(buildZoneBar(defaultProfileZones[path], 'full'));
       }
+
+      const valueReadout = document.createElement('div');
+      valueReadout.className = 'live-value-readout';
+      if (liveValueError) {
+        valueReadout.classList.add('zone-bar-error');
+        valueReadout.textContent = liveValueError;
+      } else {
+        valueReadout.textContent =
+          'Current value: ' + (liveValue === undefined ? 'no data yet' : formatLiveValue(liveValue));
+      }
+      body.appendChild(valueReadout);
     }
 
     row.appendChild(header);
@@ -192,13 +283,28 @@ function populateSourceFilter(paths) {
 function loadZonesTab() {
   Promise.all([
     fetch('/plugins/signalk-alarms/paths').then((r) => r.json()),
-    fetch('/plugins/signalk-alarms/config').then((r) => r.json())
+    fetch('/plugins/signalk-alarms/config').then((r) => r.json()),
+    fetch('/plugins/signalk-alarms/values').then((r) => r.json())
   ])
-    .then(([paths, config]) => {
+    .then(([paths, config, values]) => {
       // Zones apply to raw data paths, not notification paths — those
       // belong to Tab 2. Not specified in CLAUDE.md; excluding
       // "notifications.*" here is a judgment call, flagged in the summary.
-      allPaths = paths.filter((p) => p && !p.startsWith('notifications.')).sort();
+      //
+      // Type filtering resolves the path-type question flagged in the last
+      // two sessions: exclude a path only if its current value is CONFIRMED
+      // non-numeric (string, object, or boolean — a zone can't apply to any
+      // of those). A path with no value reported yet (key absent from
+      // `values`, i.e. `values[p] === undefined`) is a different case —
+      // never having reported data isn't evidence it's non-numeric, so it
+      // stays in the list.
+      allPaths = paths
+        .filter((p) => p && !p.startsWith('notifications.'))
+        .filter((p) => {
+          const v = values[p];
+          return v === undefined || typeof v === 'number';
+        })
+        .sort();
       // GET /plugins/signalk-alarms/config returns the full stored envelope
       // ({enabled, configuration}), not our data directly — our
       // pathSettings/profiles live under .configuration. Confirmed against

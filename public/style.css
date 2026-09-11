@@ -206,3 +206,10 @@ body {
 .zone-bar-error {
   color: #c62828;
 }
+
+.live-value-readout {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+  color: #333;
+  font-family: monospace;
+}

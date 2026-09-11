@@ -263,6 +263,14 @@ Two stores, kept separate:
   `.access(level)` permission-scoping helper on top of a normal Express router — calling
   `.get()` etc. directly without `.access()` still works for routes that don't need special
   permissioning (ours doesn't).
+- **`app.getMetadata(path)` checked and ruled out — `getSelfPath(path + '.meta')` confirmed
+  correct, not just avoided by default.** Read the actual compiled implementation
+  (`dist/interfaces/plugins.js`, not just the `.ts` source): `getMetadata:
+  path_metadata_1.getMetadata` where `path_metadata_1 = require('@signalk/path-metadata')` — a
+  direct, unwrapped re-export of that static package's own function. It has no live-tree
+  fallback at all (not even the REST `/meta` endpoint's partial one) — purely static
+  units/description schema, never zones. Confirms `getSelfPath(path + '.meta')` was the right
+  call, not merely the safer-looking guess.
 
 ## Current status
 
@@ -296,14 +304,10 @@ Two stores, kept separate:
     zone entries' own `lower`/`upper` bounds when zones exist (virtually never right now, since
     `Default` seeds with empty `zones`), which is a display-only stopgap, not the real editor
     scale from the "Tab 1 — Zones" section above.
-  - The Zones tab's path list excludes `notifications.*` paths entirely (those belong to Tab 2)
-    and excludes the single empty-string path `getAvailablePaths()` returns (appears to be a
-    root/context artifact, not a real leaf path) — but does NOT otherwise filter by value type,
-    so string- or object-valued paths (e.g. `navigation.position`) currently show up in the
-    Zones list even though they can't plausibly host a numeric zone. `getAvailablePaths()`
-    returns path strings only, no type info, and adding per-path value lookups to determine
-    type felt out of scope for a static list/filter shell — revisit when Commit/real zone
-    writing exists and a bad-path-type error actually matters.
+  - **Resolved (see "Current status" below, live value awareness session):** path-type
+    filtering now excludes confirmed string/object/boolean paths via a real value snapshot,
+    not just path-string heuristics. `notifications.*` and the empty-string path stay excluded
+    as before.
   - Zone-state color palette in the Zones tab (`nominal`=green, `alert`=yellow, `warn`=orange,
     `alarm`=red, `emergency`=purple) is my own placeholder choice, not verified against Kip's
     actual gauge-zone palette referenced in "Tab 1 — Zones: editor UI decided" above — cosmetic,
@@ -323,9 +327,43 @@ Two stores, kept separate:
     `environment.wind.speedApparent`: "Get live" retrieved and rendered it correctly, a
     zone-less path showed the clean empty state, zero browser console messages, zero
     server-log errors.
-  - Open, not resolved here: whether "Get live" should appear on every row regardless of path
-    type — currently yes, same as the row itself (ties into the still-open path-type-filtering
-    question above; deliberately not resolving that here per this session's scope).
+  - "Get live" appears on every row shown, same as the row itself — see path-type filtering
+    below, which now determines which rows exist in the first place.
+- **`app.getMetadata(path)` checked, confirmed to wrap the static package — see the gotcha
+  above.** No code change; this just settles the open question from last session with
+  certainty instead of "avoided as a precaution."
+- **Path-type filtering resolved** (closes the question flagged in the last two sessions).
+  New `GET /plugins/signalk-alarms/values` endpoint returns a one-shot `{path: currentValue}`
+  snapshot for every known path (`app.getPath('vessels.' + app.selfId)`, walked per path — see
+  the gotcha above on why plain `'vessels.self'` doesn't work with this particular API). The
+  Zones tab now excludes a path only if its snapshotted value is confirmed non-numeric
+  (string, object, or boolean); a path absent from the snapshot (never reported a value) stays
+  included, since that's a different, weaker claim than "confirmed non-numeric."
+  - **Real-world finding, worth knowing before relying on the "path with no data" case again:**
+    tried to manufacture a live example (a path known to `getAvailablePaths()` but with no
+    current value) and could not — by design. `streambundle.js`'s `push()` only adds a path to
+    `availableSelfPaths` (what `getAvailablePaths()` returns) on a real **value** delta, never
+    a meta-only one; the source has an explicit comment about this (avoiding pre-registered
+    schema templates, e.g. the Weather provider's, polluting the list). Confirmed by sending a
+    meta-only delta for a brand-new path over the WS input stream: it didn't show up in
+    `/paths` OR `/values` at all — not "present with no value," just absent entirely. So on
+    this server, "listed but valueless" isn't a reachable steady state under normal operation;
+    the code still handles it correctly (verified with a direct synthetic test of the filter
+    predicate: number → keep, `0` → keep, `undefined` → keep, string/object/boolean → exclude)
+    in case that ever changes or some other path produces the gap.
+- **Live value marker, per expanded row.** Opens one WebSocket subscription
+  (`/signalk/v1/stream?subscribe=none`, then `{context: 'vessels.self', subscribe: [{path,
+  period: 1000}]}` — confirmed against `src/subscriptionmanager.js` and `src/interfaces/ws.js`,
+  not assumed) when a row expands, shows the current value as plain text near the bar, closes
+  the socket on collapse or when a different row is expanded. Verified live: expanding
+  `environment.wind.speedApparent` (continuously streaming from the demo data generator) showed
+  an initial value that visibly updated a few seconds later; confirmed via a runtime
+  `WebSocket` wrapper (not just visual inspection) that switching rows closes the previous
+  socket before opening the next, and collapsing closes it too — never more than one open at
+  once, never left dangling.
+- Zero browser console messages and zero server-log errors across this whole session
+  (getMetadata check, `/values` endpoint including the debugging false start on
+  `'vessels.self'`, filtering, and the live value marker).
 
 ## Not yet decided / next session
 

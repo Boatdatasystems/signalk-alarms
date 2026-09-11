@@ -76,6 +76,36 @@ module.exports = function (app) {
       const meta = app.getSelfPath(path + '.meta');
       res.json({ zones: (meta && meta.zones) || null });
     });
+
+    // One-shot snapshot of every known path's current value, for the Zones
+    // tab's type filtering (exclude confirmed string/object paths) — not a
+    // per-row subscription. app.getPath(path) is the same mechanism the REST
+    // /vessels/self endpoint itself uses server-side (src/interfaces/rest.js:
+    // app.signalk.retrieve(), walked down to the requested path — getPath()
+    // does the identical _.get() internally) — one bulk read of the live
+    // tree, not N per-path calls. NOTE: 'vessels.self' does NOT work here —
+    // unlike the REST route (which special-cases the literal string 'self'
+    // and substitutes app.selfId before its own tree walk), getPath() does a
+    // raw lodash _.get() with no such substitution, so plain 'self' silently
+    // resolves to nothing. Confirmed by testing against a running server:
+    // 'vessels.self' returned an empty tree, 'vessels.' + app.selfId (the
+    // real vessel UUID, also confirmed real via app.selfId) returned the
+    // populated one. Node shape confirmed too: {value, $source, timestamp,
+    // meta}; value can be a number, string, object, or absent entirely for a
+    // path that's never reported data.
+    router.get('/values', (req, res) => {
+      const tree = app.getPath('vessels.' + app.selfId) || {};
+      const paths = app.streambundle.getAvailablePaths();
+      const values = {};
+      paths.forEach((path) => {
+        if (!path) return;
+        const node = path
+          .split('.')
+          .reduce((obj, key) => (obj && typeof obj === 'object' ? obj[key] : undefined), tree);
+        values[path] = node && Object.prototype.hasOwnProperty.call(node, 'value') ? node.value : undefined;
+      });
+      res.json(values);
+    });
   };
 
   return plugin;
