@@ -1,0 +1,11 @@
+{
+  "name": "signalk-alarms",
+  "version": "0.1.0",
+  "description": "Savable, switchable alarm profiles for SignalK zones and notification sounds",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-webapp"
+  ],
+  "main": "index.js",
+  "license": "MIT"
+}

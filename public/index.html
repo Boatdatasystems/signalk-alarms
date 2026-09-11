@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Signal K Alarms</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="profile-bar">
+    <label for="profile-select">Profile</label>
+    <select id="profile-select">
+      <option value="Default">Default</option>
+    </select>
+    <button id="save-btn" type="button">Save</button>
+    <button id="save-as-btn" type="button">Save as...</button>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="zones" type="button">Zones</button>
+    <button class="tab-btn" data-tab="notifications" type="button">Notifications</button>
+  </nav>
+
+  <main>
+    <section id="tab-zones" class="tab-panel active">
+      <p class="placeholder">Zone editor coming soon.</p>
+    </section>
+    <section id="tab-notifications" class="tab-panel">
+      <p class="placeholder">Notification sound bindings coming soon.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
