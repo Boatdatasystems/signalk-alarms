@@ -137,6 +137,16 @@ Get Live/Send-to-server are the same direction (Server→Profile) at row-scope v
 Commit/Send-to-server are the same direction (Profile→Server) at row-scope vs. all-scope.
 Refresh is the only pure-read action, safe to run anytime.
 
+**Per-row sync-status display — decided, implemented and verified (see "Current status").** The
+expanded row's main bar always shows Profile data — no more toggling between "live preview" and
+"stored" at that widget, since Get Live now writes into Profile rather than just previewing it.
+The expanded row shows a clear, always-visible sync-status indicator instead (matches server /
+differs from server / not yet checked), reusing the same `mismatchedPaths` state Refresh already
+computes — shown on BOTH the collapsed thumbnail and the expanded row, not just collapsed. If
+Refresh has never been run, that's its own distinct "not yet checked" state, not a false
+"matches". Same underlying bug fix as the expanded-row-bar-staleness issue below: both traced to
+the same now-removed `liveZones`-preferring render branch.
+
 ## Tab 1 — Zones: editor UI decided
 
 - Single wide track per path, zones drawn as colored bands on it (same visual language as
@@ -172,13 +182,8 @@ Refresh is the only pure-read action, safe to run anytime.
   live system and the active profile's in-memory state; naming/persisting an actual profile
   is still the **global** action described in "App structure" above — a profile is a full
   snapshot of every zone here plus every sound binding on Tab 2, not just one path's zones.
-- **"Get live" button, per row — REVISED:** originally a pure preview (draft-only, nothing
-  persisted until Commit). **Now also writes straight through to the stored profile**
-  (`profiles.Default.zones[path]`) immediately, not just the row's draft editor — per the
-  "Stored state vs. live" principle above. Still does NOT touch the live server in either
-  direction — Commit remains the only thing that writes `meta.zones`; Get Live only ever
-  reads live → writes stored + draft. No confirmation needed: reading live data and saving
-  our own record of it isn't a change to the live system.
+- **"Get live" button, per row:** see "Two-state model: Server vs. Profile" above for the
+  current, authoritative description (Server → Profile, one path, no confirmation needed).
 - **Verified:** reading a path's live `meta.zones` is `app.getSelfPath(path + '.meta')` — a
   documented plugin API method ("Returns the entry for the provided path starting from
   `vessels.self` in the full data model", per the ServerAPI docs), composed with `.meta` since
@@ -724,6 +729,46 @@ Refresh is the only pure-read action, safe to run anytime.
   - Zero browser console messages, zero new `signalk.service` log errors on either server;
     `signalk.service` required one restart on the Pi (backend `index.js` changed) and came back
     healthy immediately, same PID throughout the rest of testing.
+- **Fixed: expanded row's main bar staleness after Commit; added the per-row sync-status
+  indicator.** Two fixes asked for, but reproduction traced them to the same root cause —
+  stated explicitly since the prompt asked directly whether they were related.
+  - **Reproduced Fix 1 before touching code, as asked.** Committing on a row that had never had
+    "Get live" clicked already refreshed the main bar correctly — no bug in that path. The bug
+    only appeared after "Get live" had been clicked at least once on that row: it left `liveZones`
+    (a per-row snapshot the bar preferred over Profile whenever set) non-undefined, and Commit's
+    success handler never reset it, so the bar stayed frozen on the old "Get live" snapshot —
+    confirmed by watching the thumbnail turn correctly while the main bar stayed stuck red, then
+    watching a second "Get live" click "fix" it by re-populating that same stale variable.
+  - **Fix 2 (per-row sync-status indicator) retires that entire `liveZones` branch** — the bar
+    now unconditionally renders `defaultProfileZones[path]`, so Fix 1 falls out of Fix 2
+    automatically rather than needing its own separate patch. `buildSyncStatusBadge(path)` /
+    `fillSyncStatusBadge()` / `updateSyncStatusBadges()` reuse `mismatchedPaths` (the exact Set
+    Refresh already computes) for a 3-state badge (matches/differs/not yet checked) shown via one
+    shared `data-sync-path` attribute on both the thumbnail and the expanded row, updated in
+    place (not a full re-render) so autosave firing mid-typing can't steal focus.
+  - **Leftover old labeling found and removed, as asked to check for:** the toolbar's
+    "LIVE (FROM SERVER)" / "Profile (Default)" text label (a holdover from the pre-two-state-model
+    live-preview design) was still present and still driven by the same stale `liveZones` check —
+    removed entirely, replaced by the sync-status badge in the same toolbar slot.
+  - **Real bug found while wiring the indicator up, not something introduced here:**
+    `saveProfileNow` (autosave) was deleting the just-edited path from `mismatchedPaths` on
+    success — copied from Get Live/Commit's own success handlers, where that's correct (they
+    genuinely sync Profile to Server), but backwards for autosave, which only ever writes
+    Profile and never touches Server. Left uncaught, it would have silently shown a
+    just-edited, never-pushed path as "matches" instead of "differs". Fixed by adding to
+    `mismatchedPaths` instead of deleting from it (only when a Set already exists, i.e. Refresh
+    has run at least once).
+  - Verified end-to-end, scratch server first then the Pi: reproduced the exact stale-bar
+    behavior against the pre-fix code (both the working "never touched Get Live" case and the
+    broken "Get Live then Commit" case) before changing anything. Post-fix: committed on an
+    expanded row and watched the main bar update immediately; loaded the page fresh and
+    confirmed "Not yet checked" on every row, not a false "matches"; ran Refresh and watched a
+    matching and a WS-injected mismatched row badge correctly on both thumbnail and expanded
+    view, live, mid-typing, without a full re-render; resolved the mismatch via Send-to-server
+    and watched the badge flip to "matches" automatically, no second manual Refresh needed.
+  - No backend changes this session (frontend/CSS only) — no `signalk.service` restart needed
+    on either server, just a page reload. Zero browser console messages, zero new log errors on
+    both.
 
 ## Not yet decided / next session
 

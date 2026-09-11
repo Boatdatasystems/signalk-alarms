@@ -406,4 +406,48 @@ server. `signalk.service` needed one restart on the Pi (backend changed) and cam
 immediately.
 
 ---
+
+**Refresh main bar after Commit; add per-row sync-status indicator**
+
+Asked for: two fixes, reproduce each first. (1) the expanded row's main bar stays stale after
+Commit until "Get live" is clicked. (2) add a clear sync-status indicator (matches/differs/not
+yet checked) to both the thumbnail and expanded row, reusing Refresh's existing comparison, and
+remove any leftover live/stored labeling that no longer reflects the two-state model.
+
+Reproduced Fix 1 before writing any code: committing on a row that had never had "Get live"
+clicked already worked correctly. The bug only appeared after "Get live" had been clicked at
+least once -- it left a per-row `liveZones` snapshot set, which the bar preferred over Profile,
+and Commit's success handler never reset it. Confirmed by watching the thumbnail update
+correctly while the main bar stayed stuck on the old snapshot, then watching a second "Get
+live" click "fix" it by re-populating that same variable.
+
+Fix 2 turned out to retire the exact branch responsible for Fix 1, not a separate patch:
+```
+buildSyncStatusBadge(path) / fillSyncStatusBadge() / updateSyncStatusBadges() -- reuse
+  mismatchedPaths (same Set Refresh computes), 3-state badge, shared data-sync-path attribute
+  on both thumbnail and expanded row, updated in place (not renderZonesList()) so autosave
+  firing mid-typing can't steal focus
+main bar: unconditionally renders defaultProfileZones[path] now, no more liveZones branch
+```
+Leftover labeling found and removed, as asked to check for: the toolbar's old "LIVE (FROM
+SERVER)" / "Profile (Default)" text, still driven by the same stale `liveZones` check --
+replaced by the sync-status badge in the same slot.
+
+Found while wiring the indicator, not something this session introduced: `saveProfileNow`
+(autosave) was deleting the just-edited path from `mismatchedPaths` on success -- correct
+logic copied from Get Live/Commit (which genuinely sync Profile to Server) but backwards for
+autosave, which only ever writes Profile. Left uncaught, a just-edited never-pushed path would
+have shown as "matches" instead of "differs". Fixed by adding to the set instead of deleting.
+
+Verified end-to-end, scratch then the Pi: reproduced the pre-fix stale-bar bug in both the
+working and broken cases before touching code. Post-fix: Commit updates the main bar
+immediately; a fresh page load shows "Not yet checked" everywhere, not a false "matches";
+Refresh badges a matching and a WS-injected mismatched row correctly on both thumbnail and
+expanded view, updating live mid-typing without a full re-render; Send-to-server resolves the
+badge automatically, no second manual Refresh needed.
+
+No backend changes this session (frontend/CSS only) -- no `signalk.service` restart needed on
+either server. Zero browser console messages, zero new log errors on both.
+
+---
 *Appended as sessions complete and results come back.*

@@ -34,28 +34,29 @@ let allPaths = [];
 let defaultProfileZones = {};
 let expandedPath = null;
 
-// Only relevant for whichever row is currently expanded (accordion is
-// single-open, so one set of live-view state is enough). undefined = this
-// row hasn't fetched live data yet, still showing Profile. null = fetched,
-// server has no live zones for this path. array = fetched live zones.
-let liveZones;
+// liveFetchError: only relevant for whichever row is currently expanded
+// (accordion is single-open). Surfaces a "Get live" failure (bad fetch or
+// failed persist) as an error message -- no more separate "live preview"
+// state to hold the fetched result itself, since Get live writes straight
+// into Profile (editableZones/defaultProfileZones) rather than previewing
+// it in a side channel. See CLAUDE.md "Per-row sync-status display".
 let liveFetchError = null;
 let liveSyncStatus = null; // {type: 'pending'|'error', message} -- Get live's own network status
 
 // Live value marker: one WebSocket subscription for whichever row is
 // expanded, opened on expand and closed on collapse/switch — see the header
 // click handler. liveValue undefined = no reading yet; liveValueError set on
-// socket failure. Distinct from liveZones above -- this is the path's
-// current numeric reading, not its zone bounds.
+// socket failure. This is the path's current numeric reading, distinct from
+// its zone bounds.
 let liveValueSocket = null;
 let liveValue;
 let liveValueError = null;
 
 // The editable view of Profile for whichever row is expanded -- same
-// single-active-row pattern as liveZones/liveValue above. Plain numeric
-// inputs, not drag -- that's deliberately deferred to a later session.
-// A path's real zones are an array (a warn band and a separate alarm band
-// on the same path is normal), so this is a list, not a single triple.
+// single-active-row pattern as liveValue above. Plain numeric inputs, not
+// drag -- that's deliberately deferred to a later session. A path's real
+// zones are an array (a warn band and a separate alarm band on the same
+// path is normal), so this is a list, not a single triple.
 let editableZones = [];
 let autosaveTimer = null;
 let autosaveStatus = null; // {type: 'pending'|'success'|'error', message} -- editing -> Profile
@@ -274,9 +275,18 @@ function saveProfileNow(path, rows) {
     .then(({ ok, data }) => {
       if (!ok) throw new Error(data.error || 'Autosave failed');
       defaultProfileZones[path] = data.zones;
-      if (mismatchedPaths) mismatchedPaths.delete(path);
+      // Autosave only ever writes Profile, never Server -- unlike Get
+      // live/Commit/Send-to-server (which genuinely sync the two and
+      // correctly clear the mismatch), an edit here should be treated as
+      // differing from the server until the next Refresh/Commit/
+      // Send-to-server proves otherwise. Found this inverted (silently
+      // marking a just-edited, never-pushed path as "matches") while
+      // wiring up the sync-status indicator -- a real bug from last
+      // session, not something introduced here.
+      if (mismatchedPaths) mismatchedPaths.add(path);
       autosaveStatus = { type: 'success', message: 'Saved' };
       updateAutosaveIndicator();
+      updateSyncStatusBadges(path);
     })
     .catch((err) => {
       autosaveStatus = { type: 'error', message: err.message };
@@ -353,6 +363,52 @@ function computeMismatches(liveZonesByPath) {
     if (!zonesEqual(profileZones, liveZones)) mismatches.add(path);
   });
   return mismatches;
+}
+
+// --- Per-row sync-status indicator (CLAUDE.md "Two-state model" ->
+// "Per-row sync-status display") -----------------------------------------
+//
+// Reuses mismatchedPaths -- the exact same state that already drives the
+// thumbnail's mismatch badge -- rather than tracking this as a second,
+// parallel fact. Three states, not two: a path Refresh has never checked
+// is genuinely unknown, not a false "matches".
+function syncStatusFor(path) {
+  if (!mismatchedPaths) return 'unknown';
+  return mismatchedPaths.has(path) ? 'differs' : 'matches';
+}
+
+function fillSyncStatusBadge(el, path) {
+  const status = syncStatusFor(path);
+  el.className = 'sync-status-badge sync-status-' + status;
+  if (status === 'unknown') {
+    el.textContent = 'Not yet checked';
+    el.title = "Run Refresh to compare this path's Profile zones against the server.";
+  } else if (status === 'differs') {
+    el.textContent = '≠ server';
+    el.title = "Profile's stored zones differ from what's live on the server, as of the last Refresh.";
+  } else {
+    el.textContent = '✓ matches server';
+    el.title = "Profile's stored zones match what's live on the server, as of the last Refresh.";
+  }
+}
+
+function buildSyncStatusBadge(path) {
+  const el = document.createElement('span');
+  el.dataset.syncPath = path;
+  fillSyncStatusBadge(el, path);
+  return el;
+}
+
+// In-place update for every badge belonging to this path (the thumbnail's,
+// and the expanded row's copy if this happens to be the expanded path) --
+// deliberately not a renderZonesList() call. Autosave (the only caller)
+// fires mid-typing; a full re-render there would tear down and rebuild the
+// inputs the user might still be focused on, same reasoning as
+// updateLiveValueReadout/updateAutosaveIndicator above.
+function updateSyncStatusBadges(path) {
+  document.querySelectorAll('.sync-status-badge[data-sync-path="' + path + '"]').forEach((el) => {
+    fillSyncStatusBadge(el, path);
+  });
 }
 
 function renderGlobalActions() {
@@ -562,17 +618,13 @@ function renderZonesList() {
 
     header.appendChild(name);
 
-    // Per the global Refresh action (CLAUDE.md "Two-state model"): marks
-    // every row whose Profile zones differ from the server, including
-    // collapsed rows -- the point is a whole-list-at-a-glance scan, so this
-    // lives in the header, not inside the (collapsed, invisible) body.
-    if (mismatchedPaths && mismatchedPaths.has(path)) {
-      const mismatchBadge = document.createElement('span');
-      mismatchBadge.className = 'mismatch-badge';
-      mismatchBadge.textContent = '≠ server';
-      mismatchBadge.title = "Profile's stored zones differ from what's live on the server, as of the last Refresh.";
-      header.appendChild(mismatchBadge);
-    }
+    // Per-row sync-status indicator (CLAUDE.md "Two-state model" -> "Per-row
+    // sync-status display"): shown on the thumbnail here AND inside the
+    // expanded body below, both built from the same buildSyncStatusBadge()
+    // -- one source of truth (mismatchedPaths), not two. Lives in the
+    // header (not just the body) since collapsed rows need it too -- the
+    // whole point is a whole-list-at-a-glance scan.
+    header.appendChild(buildSyncStatusBadge(path));
 
     header.appendChild(badge);
     // Mini preview always reflects Profile, regardless of whether the
@@ -581,7 +633,6 @@ function renderZonesList() {
 
     header.addEventListener('click', () => {
       expandedPath = expandedPath === path ? null : path;
-      liveZones = undefined;
       liveFetchError = null;
       // Reads from Profile -- there's no separate "blank vs. populated"
       // draft state to worry about anymore, Profile IS what's shown.
@@ -599,18 +650,24 @@ function renderZonesList() {
     const body = document.createElement('div');
     body.className = 'path-row-body';
 
-    // liveZones/liveFetchError are single (not per-path) state — only
-    // meaningful for whichever row is actually expanded, since expanding a
-    // *different* row resets them (see the header click handler above).
-    // Building this content for collapsed rows too would read stale state
-    // that belongs to no particular path.
+    // liveFetchError is single (not per-path) state — only meaningful for
+    // whichever row is actually expanded, since expanding a *different* row
+    // resets it (see the header click handler above). Building this
+    // content for collapsed rows too would read stale state that belongs
+    // to no particular path.
     if (path === expandedPath) {
       const toolbar = document.createElement('div');
       toolbar.className = 'zone-bar-toolbar';
 
-      const label = document.createElement('span');
-      label.className = 'zone-bar-source-label' + (liveZones !== undefined ? ' live' : '');
-      label.textContent = liveZones !== undefined ? 'Live (from server)' : 'Profile (Default)';
+      // Per-row sync-status indicator, same badge/source-of-truth as the
+      // thumbnail's above -- per CLAUDE.md "Per-row sync-status display",
+      // this REPLACES the old "LIVE (FROM SERVER)" / "STORED (DEFAULT
+      // PROFILE)" toggle label that used to live here. That label no
+      // longer reflects how data actually flows: the bar below always
+      // shows Profile now (Get live writes into Profile rather than
+      // previewing it), so a leftover live/stored label would just be a
+      // second, contradictory claim sitting next to the real one.
+      toolbar.appendChild(buildSyncStatusBadge(path));
 
       const liveBtn = document.createElement('button');
       liveBtn.type = 'button';
@@ -625,12 +682,14 @@ function renderZonesList() {
           const liveData = await liveRes.json();
           if (!liveRes.ok) throw new Error(liveData.error || 'Failed to fetch live data');
 
-          liveZones = liveData.zones;
           liveFetchError = null;
           // Get live is Server -> Profile (and the visible row), per
           // CLAUDE.md "Two-state model" -- overwrites the editable list,
           // no confirmation needed (reading live data and saving our own
-          // record of it isn't a change to the live system).
+          // record of it isn't a change to the live system). No separate
+          // "live preview" state anymore -- editableZones IS the row now,
+          // same array Profile edits use, so this doesn't need its own
+          // render branch the way it used to.
           editableZones = zonesToRows(liveData.zones);
           renderZonesList();
 
@@ -643,8 +702,12 @@ function renderZonesList() {
 
           // Keep the local cache in sync with what the server just
           // persisted, so the mini bar and a later collapse/re-expand of
-          // this row (which reads from defaultProfileZones, not liveZones)
-          // reflect it without a full page reload.
+          // this row (which reads from defaultProfileZones) reflect it
+          // without a full page reload. Also fixes the main bar staleness
+          // bug this session found: since the bar below always renders
+          // from defaultProfileZones now (no more liveZones branch), simply
+          // updating this and calling renderZonesList() is enough to keep
+          // it current after Commit too, not just after Get live.
           defaultProfileZones[path] = data.zones;
           if (mismatchedPaths) mismatchedPaths.delete(path);
           liveSyncStatus = null;
@@ -656,7 +719,6 @@ function renderZonesList() {
         }
       });
 
-      toolbar.appendChild(label);
       toolbar.appendChild(liveBtn);
       body.appendChild(toolbar);
 
@@ -665,13 +727,13 @@ function renderZonesList() {
         err.className = 'zone-bar-empty zone-bar-error';
         err.textContent = 'Failed to fetch live data: ' + liveFetchError;
         body.appendChild(err);
-      } else if (liveZones !== undefined) {
-        const bar = buildZoneBar(liveZones, 'full', 'No live zones for this path.');
-        bar.classList.add('live');
-        body.appendChild(bar);
-      } else {
-        body.appendChild(buildZoneBar(defaultProfileZones[path], 'full'));
       }
+
+      // Always Profile -- no more live-preview branch. Reflects the
+      // current data immediately after Commit, Get live, autosave, or a
+      // fresh expand alike, since it's the same defaultProfileZones object
+      // every other action here already keeps up to date.
+      body.appendChild(buildZoneBar(defaultProfileZones[path], 'full'));
 
       const valueReadout = document.createElement('div');
       valueReadout.id = 'live-value-readout';
