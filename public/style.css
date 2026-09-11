@@ -128,6 +128,15 @@ body {
   padding-top: 0.8rem;
 }
 
+.zone-bar-wrapper.mini {
+  width: 140px;
+  flex-shrink: 0;
+}
+
+.zone-bar-wrapper.full {
+  width: 100%;
+}
+
 .zone-bar {
   position: relative;
   width: 100%;
@@ -150,6 +159,30 @@ body {
   position: absolute;
   top: 0;
   bottom: 0;
+}
+
+/* Numeric boundary labels (CLAUDE.md "Zone boundary value labels on the
+   bar") -- 'full' bar only, see buildZoneBar's comment in app.js for why
+   the thumbnail doesn't get these. A plain row below the bar, one label per
+   real (non-unbounded) zone edge, positioned at the same x% the color
+   segment boundaries use. overflow is deliberately visible, not hidden --
+   a label sitting right at 0% or 100% is allowed to spill slightly past
+   the bar's edge rather than being clipped. */
+.zone-bar-labels {
+  position: relative;
+  height: 14px;
+  margin-top: 2px;
+}
+
+.zone-bar-boundary-label {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-size: 0.65rem;
+  line-height: 14px;
+  color: #555;
+  font-family: monospace;
+  white-space: nowrap;
 }
 
 .zone-bar-empty {
@@ -290,6 +323,28 @@ body {
 .autosave-status-pending { color: #666; }
 .autosave-status-success { color: #2e7d32; }
 .autosave-status-error { color: #c62828; }
+
+.copy-zone-btn,
+.paste-zone-btn {
+  font-size: 0.85rem;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #999;
+  border-radius: 4px;
+  background: #fff;
+  color: #333;
+  cursor: pointer;
+  margin-right: 0.5rem;
+}
+
+.paste-zone-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.clipboard-status {
+  font-size: 0.8rem;
+  color: #666;
+}
 
 /* Per-row sync-status indicator (matches / differs / not yet checked) --
    shown on both the thumbnail and the expanded row, see buildSyncStatusBadge

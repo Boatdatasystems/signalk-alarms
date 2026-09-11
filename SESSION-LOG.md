@@ -450,4 +450,54 @@ No backend changes this session (frontend/CSS only) -- no `signalk.service` rest
 either server. Zero browser console messages, zero new log errors on both.
 
 ---
+
+**Copy/paste zones between paths; numeric boundary labels on the zone bar**
+
+Asked for: two independent additions. (1) Copy button stores the expanded row's zones in a
+shared in-memory (not OS) clipboard; Paste (disabled until something's copied) applies it to
+another row through the same auto-save path as any other edit, no auto-Commit. (2) show each
+zone's actual lower/upper value on the bar at the same x-position its color segment uses --
+implementer's judgment on whether the thumbnail gets these too, state which was chosen and why.
+
+Built:
+```
+copiedZones: single shared JS variable, not localStorage/OS clipboard, not persisted across reload
+Copy -> copiedZones = clone(editableZones)
+Paste -> editableZones = clone(copiedZones); flushPendingAutosave(); saveProfileNow(); no Commit
+buildZoneBar(): full bar only gets a labels row under it, one label per real (non-fallback) edge
+```
+
+Boundary-label placement decided by implementation judgment, as explicitly allowed: **main bar
+only, not the thumbnail** -- 140x10px isn't enough room for legible numeric text even for one
+zone's two labels, the 28px-tall full bar has room. Verified a 2-zone contiguous case (warn
+0-20, alarm 20-30) renders the shared boundary as one clean "20", not two overlapping labels.
+
+Found and fixed, flagged as NOT specific to copy/paste despite being caught while testing it:
+`saveProfileNow` is async; Paste's (and Remove's, and the state-dropdown's) handler called
+`renderZonesList()` synchronously right after triggering the save, before the save's promise
+resolved and updated `defaultProfileZones[path]` -- so the bar rendered stale (e.g. still "No
+zones defined" right after a successful paste) even though the inputs were already correct and
+the save had genuinely succeeded server-side (confirmed via direct `GET /config`, not just the
+UI -- a timing bug, not data loss). Fixed with a `data-bar-path`-tagged in-place
+`updateZoneBars(path)` refresher called from `saveProfileNow`'s success handler, same pattern as
+the existing sync-badge/autosave-indicator updaters -- fixes it for every caller, not just Paste.
+
+Confirmed Paste needed no special-casing for the "differs from server" badge: it reuses
+`saveProfileNow`, which already correctly adds the edited path to `mismatchedPaths` (the fix
+from last session) regardless of what triggered the save.
+
+Verified end-to-end, scratch server first then the Pi, using `test.test`/`test.test2` on the Pi
+(pre-existing unconsumed scaffold paths, not any of Paddy's real battery/other in-progress
+zones): copied a zone from one path, pasted into another, confirmed the target row's inputs,
+bar, and thumbnail all updated immediately, confirmed persistence via direct `GET /config` both
+times (not just the browser), and confirmed Refresh correctly badged both the copy-source and
+paste-target paths as "≠ server" since neither had been Committed. Reset both scratch and Pi
+test paths back to empty afterward; neither was ever Committed this session, so no live
+`meta.zones` write touched the Pi at all.
+
+No backend changes this session (frontend/CSS only) -- no `signalk.service` restart needed on
+either server. Zero browser console messages (checked on a fresh page load), zero new
+server-log errors on both.
+
+---
 *Appended as sessions complete and results come back.*

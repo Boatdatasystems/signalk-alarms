@@ -58,6 +58,15 @@ let liveValueError = null;
 // zones are an array (a warn band and a separate alarm band on the same
 // path is normal), so this is a list, not a single triple.
 let editableZones = [];
+// Copy/paste (CLAUDE.md "Copy/paste zones between paths"): a single shared,
+// in-memory clipboard slot, not the OS clipboard and not persisted across a
+// reload -- just a JS variable, deliberately never reset except by a fresh
+// page load (switching rows, Committing, etc. all leave it alone). Holds
+// the same string-shaped editable-row objects editableZones itself uses
+// (not the clean numeric zones shape), so pasting is just "replace
+// editableZones with a clone of this" -- no conversion step, same shape the
+// rest of the editor already works with.
+let copiedZones = null;
 let autosaveTimer = null;
 let autosaveStatus = null; // {type: 'pending'|'success'|'error', message} -- editing -> Profile
 let commitStatus = null; // {type: 'pending'|'success'|'error', message} -- Commit's own Profile -> Server push
@@ -125,13 +134,27 @@ function editableRowsToZones(rows) {
   return zones;
 }
 
+// Deep-enough clone for a row array (each row is a flat object of
+// primitives -- lower/upper/state/message are all strings or undefined, no
+// nesting) -- used by Copy (to snapshot editableZones without the clipboard
+// staying aliased to the live row, which future edits to that row would
+// then silently leak into) and by Paste (so editing the pasted row doesn't
+// mutate the clipboard itself, corrupting a later paste elsewhere).
+function cloneZoneRows(rows) {
+  return rows.map((z) => ({ lower: z.lower, upper: z.upper, state: z.state, message: z.message }));
+}
+
 function pathSource(path) {
   return path.split('.')[0];
 }
 
+function formatNumber(value) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(3);
+}
+
 function formatLiveValue(value) {
   if (typeof value === 'number') {
-    return Number.isInteger(value) ? String(value) : value.toFixed(3);
+    return formatNumber(value);
   }
   return JSON.stringify(value);
 }
@@ -287,6 +310,18 @@ function saveProfileNow(path, rows) {
       autosaveStatus = { type: 'success', message: 'Saved' };
       updateAutosaveIndicator();
       updateSyncStatusBadges(path);
+      // Found via direct testing this session, not assumed: Remove/Paste/
+      // state-dropdown-change all call a synchronous renderZonesList()
+      // right after kicking off this (async) save -- which runs BEFORE
+      // this .then() updates defaultProfileZones[path] above, so that
+      // render still shows the pre-edit bar. The inputs themselves were
+      // already correct (that part of the row is local state, mutated
+      // before the save even starts) -- only the bar, which reads
+      // defaultProfileZones, was stale. In-place update here (not a full
+      // renderZonesList()) so this is also safe to run for the debounced
+      // typing path, which deliberately avoids full re-renders to protect
+      // focus -- this only ever touches the bar elements, never the inputs.
+      updateZoneBars(path);
     })
     .catch((err) => {
       autosaveStatus = { type: 'error', message: err.message };
@@ -538,9 +573,29 @@ function renderGlobalActions() {
   }
 }
 
+function buildBoundaryLabel(value, leftPercent) {
+  const label = document.createElement('span');
+  label.className = 'zone-bar-boundary-label';
+  label.style.left = leftPercent + '%';
+  label.textContent = formatNumber(value);
+  return label;
+}
+
+// Returns a wrapper containing the colored bar and, for the 'full' size
+// only, a row of numeric boundary labels underneath (CLAUDE.md "Zone
+// boundary value labels on the bar"). Decided to only add labels to 'full',
+// not 'mini': the thumbnail is 140x10px, not enough room for legible
+// numbers even for a single zone, let alone 2+ -- the full bar (28px tall,
+// full content width) has room. Callers are unaffected by the wrapper --
+// both just .appendChild() the return value, same as when this returned
+// the bar div directly.
 function buildZoneBar(zones, sizeClass, emptyMessage) {
+  const wrapper = document.createElement('div');
+  wrapper.className = 'zone-bar-wrapper ' + sizeClass;
+
   const bar = document.createElement('div');
   bar.className = 'zone-bar ' + sizeClass;
+  wrapper.appendChild(bar);
 
   if (!zones || zones.length === 0) {
     if (sizeClass === 'full') {
@@ -549,7 +604,7 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
       empty.textContent = emptyMessage || 'No zones defined for this path yet.';
       bar.appendChild(empty);
     }
-    return bar;
+    return wrapper;
   }
 
   // No stored display range (pathSettings min/max) exists yet for any path —
@@ -564,6 +619,9 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
   const highest = highs.length ? Math.max(...highs) : lowest + 1;
   const span = highest - lowest || 1;
 
+  const labelsRow = sizeClass === 'full' ? document.createElement('div') : null;
+  if (labelsRow) labelsRow.className = 'zone-bar-labels';
+
   zones.forEach((zone) => {
     const zLower = typeof zone.lower === 'number' ? zone.lower : lowest;
     const zUpper = typeof zone.upper === 'number' ? zone.upper : highest;
@@ -574,9 +632,44 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
     seg.title =
       zone.state + ': ' + (typeof zone.lower === 'number' ? zone.lower : '-inf') + ' - ' + (typeof zone.upper === 'number' ? zone.upper : '+inf');
     bar.appendChild(seg);
+
+    // Only a REAL, explicitly-set bound gets a label -- zLower/zUpper above
+    // substitute lowest/highest purely to give an unbounded edge somewhere
+    // to render, that's not an actual configured value worth printing.
+    // Contiguous zones sharing a boundary (the current default) produce the
+    // same number from both sides at the same x-position -- expected per
+    // CLAUDE.md, not de-duplicated.
+    if (labelsRow) {
+      if (typeof zone.lower === 'number') {
+        labelsRow.appendChild(buildBoundaryLabel(zone.lower, ((zLower - lowest) / span) * 100));
+      }
+      if (typeof zone.upper === 'number') {
+        labelsRow.appendChild(buildBoundaryLabel(zone.upper, ((zUpper - lowest) / span) * 100));
+      }
+    }
   });
 
-  return bar;
+  if (labelsRow) wrapper.appendChild(labelsRow);
+
+  return wrapper;
+}
+
+// In-place refresh for every zone bar belonging to this path (the
+// thumbnail's, and the expanded row's copy if this happens to be the
+// expanded path) -- same data-attribute-driven pattern as
+// updateSyncStatusBadges. Rebuilds each from the current
+// defaultProfileZones[path] and swaps it in, without touching anything
+// else in the row (inputs, buttons) -- called from saveProfileNow's async
+// completion, including the debounced-typing path, so it must never risk
+// stealing focus from an input mid-type the way a full renderZonesList()
+// would.
+function updateZoneBars(path) {
+  document.querySelectorAll('.zone-bar-wrapper[data-bar-path="' + path + '"]').forEach((oldWrapper) => {
+    const sizeClass = oldWrapper.classList.contains('mini') ? 'mini' : 'full';
+    const newWrapper = buildZoneBar(defaultProfileZones[path], sizeClass);
+    newWrapper.dataset.barPath = path;
+    oldWrapper.replaceWith(newWrapper);
+  });
 }
 
 function renderZonesList() {
@@ -628,8 +721,12 @@ function renderZonesList() {
 
     header.appendChild(badge);
     // Mini preview always reflects Profile, regardless of whether the
-    // expanded view below is currently showing a live fetch.
-    header.appendChild(buildZoneBar(defaultProfileZones[path], 'mini'));
+    // expanded view below is currently showing a live fetch. data-bar-path
+    // lets updateZoneBars() find and refresh this in place after an
+    // autosave, without a full re-render -- see that function's comment.
+    const miniBar = buildZoneBar(defaultProfileZones[path], 'mini');
+    miniBar.dataset.barPath = path;
+    header.appendChild(miniBar);
 
     header.addEventListener('click', () => {
       expandedPath = expandedPath === path ? null : path;
@@ -732,8 +829,12 @@ function renderZonesList() {
       // Always Profile -- no more live-preview branch. Reflects the
       // current data immediately after Commit, Get live, autosave, or a
       // fresh expand alike, since it's the same defaultProfileZones object
-      // every other action here already keeps up to date.
-      body.appendChild(buildZoneBar(defaultProfileZones[path], 'full'));
+      // every other action here already keeps up to date. data-bar-path,
+      // see updateZoneBars() -- same in-place-refresh pattern as the
+      // thumbnail's mini bar above.
+      const mainBar = buildZoneBar(defaultProfileZones[path], 'full');
+      mainBar.dataset.barPath = path;
+      body.appendChild(mainBar);
 
       const valueReadout = document.createElement('div');
       valueReadout.id = 'live-value-readout';
@@ -828,6 +929,58 @@ function renderZonesList() {
         // in, which the input handlers above already cover.
       });
       editSection.appendChild(addZoneBtn);
+
+      // Copy/paste (CLAUDE.md "Copy/paste zones between paths"): replaces
+      // wildcard path-group expansion for the common "several similar
+      // paths want identical zones" case, without pattern-matching
+      // machinery. Copy snapshots THIS row's current editableZones into the
+      // shared copiedZones slot (cloned, so later edits to this row don't
+      // leak into the clipboard); Paste (on any other expanded row)
+      // replaces that row's editableZones with a clone of the clipboard and
+      // runs it through the exact same saveProfileNow() autosave path any
+      // other edit already uses -- no new persistence mechanism, and it
+      // correctly marks the pasted path as differing from server via the
+      // same mismatchedPaths.add() fix from last session, not a special
+      // case here.
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'copy-zone-btn';
+      copyBtn.textContent = 'Copy';
+      copyBtn.title = "Copy this path's zones to paste into another path";
+      copyBtn.addEventListener('click', () => {
+        copiedZones = cloneZoneRows(editableZones);
+        renderZonesList();
+      });
+      editSection.appendChild(copyBtn);
+
+      const pasteBtn = document.createElement('button');
+      pasteBtn.type = 'button';
+      pasteBtn.className = 'paste-zone-btn';
+      pasteBtn.textContent = 'Paste';
+      // Disabled (not hidden) until something's been copied this session --
+      // keeps the control discoverable/in-place rather than the layout
+      // shifting once it becomes available.
+      pasteBtn.disabled = !copiedZones;
+      pasteBtn.title = copiedZones ? "Replace this path's zones with the copied ones" : 'Copy zones from another path first';
+      pasteBtn.addEventListener('click', () => {
+        if (!copiedZones) return;
+        editableZones = cloneZoneRows(copiedZones);
+        // Discrete action, not continuous typing -- save immediately
+        // rather than debouncing, same as Remove/state-dropdown-change.
+        flushPendingAutosave();
+        saveProfileNow(path, editableZones);
+        renderZonesList();
+        // Deliberately no auto-Commit -- pasting only changes Profile, same
+        // as typing; Commit/Send-to-server still push it live separately.
+      });
+      editSection.appendChild(pasteBtn);
+
+      if (copiedZones) {
+        const clipboardStatusEl = document.createElement('span');
+        clipboardStatusEl.className = 'clipboard-status';
+        clipboardStatusEl.textContent = copiedZones.length + ' zone(s) copied';
+        editSection.appendChild(clipboardStatusEl);
+      }
 
       const autosaveEl = document.createElement('span');
       autosaveEl.id = 'autosave-status';

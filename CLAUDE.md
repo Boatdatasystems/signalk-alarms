@@ -209,7 +209,37 @@ the same now-removed `liveZones`-preferring render branch.
   top-level SignalK namespace (navigation, electrical, propulsion, etc.), derived
   automatically from the path string. No manual category tagging, nothing to keep in sync.
 
-## Wildcard path groups — decided
+## Copy/paste zones between paths — decided, implemented and verified (see "Current status")
+
+Replaces the wildcard-expansion idea below for the common case (several similar paths that
+want identical zones, e.g. `electrical.batteries.lifepo4.cellVoltage.1/.2/.3/.4`): a **Copy**
+button on the expanded row's editor copies that row's current Profile zones (whatever
+`editableZones` currently holds) into a single shared, in-memory clipboard slot — not the OS
+clipboard, just an in-page JS variable, since there's no need for this to survive a reload or
+be pasted anywhere outside this app. A **Paste** button (disabled/hidden until something's
+been copied this session) on any other expanded row applies that copied array into ITS
+`editableZones`, replacing whatever was there, then goes through the exact same auto-save path
+as any other edit — no new persistence mechanism needed. Paste doesn't auto-Commit — pasting
+only changes Profile, same as typing; Commit/Send-to-server still push it live same as any
+other edit.
+
+## Zone boundary value labels on the bar — decided, implemented and verified (see "Current status")
+
+The colored zone bar should show the actual numeric lower/upper value at each zone boundary,
+positioned at the same proportional x-location the color segments already use for their
+auto-fit scale — not just color, so the set values are visible without opening the editor.
+Whether this fits legibly on the collapsed thumbnail as well as the expanded main bar, or only
+the latter given the thumbnail's small size, is left to implementation judgment — flag if the
+thumbnail turns out too cramped rather than forcing it. **Resolved: main bar only** — see
+"Current status" for the reasoning.
+
+## Wildcard path groups — decided, but DEPRIORITIZED in favor of copy/paste (see above)
+
+Never built. A simpler, lower-effort alternative was chosen instead for the actual recurring
+need (e.g. several identical battery cell zones) — manual copy/paste of a row's zones to
+another row, see "Copy/paste zones between paths" above — without pattern-matching machinery.
+Kept below for reference in case genuinely dynamic path sets become a real need later, but not
+scheduled.
 
 - `@signalk/zones` doesn't support wildcards itself — its `key` field is a literal path
   string fed straight into `app.streambundle.getSelfStream(key)`, no glob support in the
@@ -769,6 +799,52 @@ the same now-removed `liveZones`-preferring render branch.
   - No backend changes this session (frontend/CSS only) — no `signalk.service` restart needed
     on either server, just a page reload. Zero browser console messages, zero new log errors on
     both.
+- **Copy/paste zones between paths; numeric boundary labels on the zone bar.** Two independent
+  additions, no backend changes — both pure frontend, reusing existing routes/mechanisms.
+  - **Copy/paste:** `copiedZones` is a single shared, in-memory JS variable (not the OS
+    clipboard, not persisted — explicitly scoped to the current page load). Copy stores the
+    expanded row's current `editableZones`; Paste (disabled until something's been copied)
+    replaces the target row's `editableZones` with a clone of the copied array, then runs
+    through the exact same `flushPendingAutosave()` + `saveProfileNow()` path any other
+    discrete edit uses — no special-casing needed for Paste to correctly mark the pasted path
+    as "differs from server," since that's already `saveProfileNow`'s job for every caller.
+    Paste deliberately does not Commit — Profile-only, same as typing.
+  - **Boundary labels: main/full bar only, not the thumbnail** — implementation judgment, as
+    the prompt explicitly allowed. The thumbnail is 140×10px, not enough room for legible
+    numeric text even for a single zone's two labels, let alone a multi-zone path; the main bar
+    (28px tall, full row width) has room. A `.zone-bar-labels` row sits under the bar, one
+    label per real (explicitly-set) zone edge — not per the `zLower`/`zUpper` fallback values
+    used for unbounded-edge rendering — positioned at the same x% the color segment uses.
+    Verified live with both a 1-zone path (single "100"/"200" pair) and a 2-zone contiguous
+    path (warn 0–20, alarm 20–30): the shared boundary at 20 renders as one clean, non-
+    overlapping "20", confirming no de-duplication logic was needed.
+  - **Real bug found and fixed, NOT specific to copy/paste despite being caught while testing
+    it:** `saveProfileNow` is async; Paste's (and Remove's, and the state-dropdown's) click
+    handler called `renderZonesList()` synchronously right after triggering the save, which ran
+    before the save's promise resolved and updated `defaultProfileZones[path]` — so the
+    resulting render showed the bar stuck on stale data (e.g. "No zones defined for this path
+    yet." right after a successful paste) even though the input fields (driven by local
+    `editableZones`, mutated synchronously) were already correct, and even though the save
+    itself had genuinely succeeded server-side (confirmed via a direct `GET /config` check
+    during debugging — a rendering/timing bug, not a data-loss bug). **Fixed** by tagging bar
+    wrapper elements with `data-bar-path` and adding an `updateZoneBars(path)` in-place
+    refresher (mirroring the existing `updateSyncStatusBadges`/`updateAutosaveIndicator`
+    pattern), called from inside `saveProfileNow`'s success handler — this fixes the bug for
+    every caller of `saveProfileNow`, not just Paste, since it's the same async-render race any
+    discrete non-debounced edit action was exposed to.
+  - Verified end-to-end, scratch server first then the Pi (`test.test` → copy →
+    `test.test2` → paste, both times using paths with no real consumer): pasted zones appeared
+    correctly in the target row's inputs, bar, and thumbnail immediately, confirmed persisted
+    via a direct `GET /config` call (not just the browser) both times, and Refresh correctly
+    showed both the copy-source and paste-target paths as "≠ server" (neither had been
+    Committed). On the Pi specifically, used `test.test`/`test.test2` — pre-existing,
+    unconsumed scaffold paths, not any of Paddy's real battery/other in-progress zones — and
+    reset both back to empty via `/persist-zone` afterward; neither was ever Committed during
+    this session, so no live `meta.zones` write touched the Pi at all, nothing to clean up
+    there. No backend changes this session, so no `signalk.service` restart needed on either
+    server — confirmed same PID throughout. Zero browser console messages (checked on a fresh
+    page load, not just after the test interactions) and zero new server-log errors on both
+    scratch and the Pi.
 
 ## Not yet decided / next session
 
