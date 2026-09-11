@@ -98,6 +98,25 @@ Two stores, kept separate:
   decision), so `zones` and `sounds` are linked only by path + state at runtime, not by any
   direct reference between the two stores.
 
+## Stored state vs. live: sync philosophy — decided
+
+General principle: the plugin's stored state (`profiles`) should generally track live server
+reality, not silently drift from it. Two deliberate exceptions where local state does NOT
+auto-follow live:
+- **A row with in-progress edits** — an open draft (typed-but-not-committed values) is never
+  overwritten except by an explicit action on that same row (its own "Get live" click, or
+  discarding it). Commit remains the only thing that pushes a draft OUT to the live server;
+  nothing pushes automatically in that direction.
+- **A freshly-loaded (switched-to) profile** — loading a profile is itself an explicit choice
+  to represent that profile's own stored values; it shouldn't be immediately overwritten by
+  whatever happens to be live, which may reflect a different profile that was previously
+  active.
+This is why per-row "Get live" now writes through to stored state (see "Tab 1 — Zones" below)
+rather than staying draft-only as originally designed — a deliberate, explicit,
+single-path instance of "pull live into stored." A separate **global** "sync all paths from
+live" action is also wanted, still undecided/unbuilt — see "Not yet decided" below, since a
+bulk version needs its own confirmation step given the much larger blast radius.
+
 ## Tab 1 — Zones: editor UI decided
 
 - Single wide track per path, zones drawn as colored bands on it (same visual language as
@@ -133,14 +152,13 @@ Two stores, kept separate:
   live system and the active profile's in-memory state; naming/persisting an actual profile
   is still the **global** action described in "App structure" above — a profile is a full
   snapshot of every zone here plus every sound binding on Tab 2, not just one path's zones.
-- **"Get live" button, per row (decided):** the mirror of Commit, reversed direction — pulls
-  whatever zone configuration is *actually* currently governing that path's live alarm state
-  (the path's SignalK `meta.zones`, regardless of who set it — us, `@signalk/zones`' own
-  admin UI, or something configured before this plugin existed) into the row's local,
-  uncommitted editor state, overwriting whatever's there. Exists because our own `profiles`
-  store and the live system can genuinely drift — first-time import of pre-existing zones, or
-  reconciling after an out-of-band edit. No confirmation prompt needed for uncommitted local
-  edits it overwrites — nothing's live until Commit anyway.
+- **"Get live" button, per row — REVISED:** originally a pure preview (draft-only, nothing
+  persisted until Commit). **Now also writes straight through to the stored profile**
+  (`profiles.Default.zones[path]`) immediately, not just the row's draft editor — per the
+  "Stored state vs. live" principle above. Still does NOT touch the live server in either
+  direction — Commit remains the only thing that writes `meta.zones`; Get Live only ever
+  reads live → writes stored + draft. No confirmation needed: reading live data and saving
+  our own record of it isn't a change to the live system.
 - **Verified:** reading a path's live `meta.zones` is `app.getSelfPath(path + '.meta')` — a
   documented plugin API method ("Returns the entry for the provided path starting from
   `vessels.self` in the full data model", per the ServerAPI docs), composed with `.meta` since
@@ -553,9 +571,68 @@ Two stores, kept separate:
     reproduction, fixing, and re-verification; `signalk.service` stayed on the same PID
     throughout (no restart needed — `index.js`/backend was untouched, only `public/app.js` and
     `public/style.css` changed, both static files).
+- **Remove-all-zones validation bug fixed; Get live now persists to stored profile.** Two
+  independent fixes, not entangled at the feature level — kept separate in the writeup below —
+  but see the shared-helper note at the end, which genuinely does touch both.
+  - **Remove-all-zones:** `/commit-zone` used to reject `zones: []` outright ("must be a
+    non-empty array"). Fixed by only requiring `zones` to be an array — the per-zone
+    bound/state validation loop still runs, but over whatever's actually in the (possibly
+    empty) list, so it can't block a genuinely empty submission. An empty commit now writes
+    `meta.zones: []` (core's native watcher treats an empty test list as "everything falls in
+    the implicit normal gap" — confirmed against its source last session, functionally no
+    alarm) and, in the stored profile, **deletes** the path's key entirely rather than storing
+    a stale `[]` — confirmed by checking `GET /config` afterward and seeing no trace of the
+    path, not just that the commit didn't error.
+  - **Get live persists to stored profile:** per the revised "Get live" decision above. New
+    backend route `POST /persist-zone` (body `{path, zones}`) writes straight into
+    `profiles.Default.zones[path]`, never touches `meta` or calls `app.handleMessage`. The
+    frontend's Get Live handler now does two sequential calls: existing `GET /live-meta` (read,
+    unchanged), then this new route with the result (persist). Kept as two small
+    single-responsibility endpoints rather than one combined route, since `GET /live-meta` was
+    already independently verified across three prior sessions and combining would have
+    duplicated that logic for no real benefit.
+  - **Shared-helper question, answered directly (asked to flag this explicitly):** no shared
+    persist helper existed before this session — the profile-merge-and-save logic was inline
+    inside `/commit-zone` only. Extracted it into `persistZonesForPath(path, zones, cb)`, now
+    called by both `/commit-zone`'s persist step and the new `/persist-zone`. Also extracted
+    `normalizeZones()` (shape cleanup only, no rejection) for the same reason. This is also
+    **where the two fixes turned out more entangled than the prompt's framing suggested**: Fix
+    1's core behavior change — an empty array means "delete the key," not "store `[]`" — lives
+    in `persistZonesForPath`, which Fix 2's new route depends on unconditionally. When Get Live
+    finds a path with genuinely no live zones (`meta.zones: null`), it persists `[]`, which
+    hits the exact same delete-key branch. Didn't design it that way on purpose going in; it
+    fell out of extracting the shared helper and turned out to be the correct behavior for both
+    callers, not a coincidence worth re-litigating, but flagging as asked rather than presenting
+    the two fixes as fully independent when one now quietly depends on the other's semantics.
+  - Verified against the actual deployed Pi (not the scratch server): Fix 1 confirmed twice —
+    directly via API (commit a zone, commit `[]`, confirm `meta.zones: []` and no stored key)
+    and through the real UI (Remove button down to zero rows, Commit, same result). Fix 2
+    confirmed via manual live-meta injection (same WS technique as prior sessions): "Get live"
+    on a path with an injected live-only zone updated the stored profile (checked `GET /config`
+    directly, not just the browser), collapsing and re-expanding the row afterward showed the
+    synced data without touching Commit, and clicking "Get live" again with an unsaved draft
+    edit sitting in the inputs correctly discarded that draft in favor of newly-injected live
+    data — while a second, unrelated path's stored data and draft were unaffected throughout.
+  - One real testing hiccup, not a product bug: mid-session, a stale element reference from the
+    `find` browser tool (reused across two re-renders) caused a click meant for `test.test`'s
+    Commit button to land on `test.test2`'s instead — caught immediately by checking server
+    state directly rather than trusting the UI, and worth remembering for future sessions:
+    re-screenshot and re-locate elements after every render that could have changed the DOM,
+    don't reuse refs across renders.
+  - Zero browser console messages, zero new `signalk.service` log errors; `signalk.service`
+    required one restart (backend `index.js` changed this session, unlike the previous
+    session's frontend-only fixes) and came back healthy immediately, same as every prior
+    restart in this project.
 
 ## Not yet decided / next session
 
 - Anchor alarm is no longer special-cased for profile auto-switching — it's just one
   notification path among all the others on Tab 2, same as everything else. Profile
   switching is manual only for now unless we revisit an auto-switch trigger later.
+- **Global bulk "sync all paths from live" button** — wanted, not yet built. Needs its own
+  confirmation step (much larger blast radius than the per-row version — touches every path's
+  stored data in one action) and writes straight to the stored profile, no per-path draft step.
+- **Live alarm-state "instant glance" dots on thumbnails** — a separate idea from the bulk
+  sync button above (notification *state*, e.g. reading `notifications.<path>` live, rather
+  than zone *bounds*). Not yet decided whether this is still wanted alongside or instead of the
+  bulk sync button — revisit.

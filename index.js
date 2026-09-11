@@ -52,6 +52,46 @@ module.exports = function (app) {
   // Mounted by the server at /plugins/signalk-alarms/* — see
   // doRegisterPlugin() in signalk-server's src/interfaces/plugins.ts.
   plugin.registerWithRouter = function (router) {
+    const validStates = ['nominal', 'alert', 'warn', 'alarm', 'emergency'];
+
+    // Shared by /commit-zone's persist step and /persist-zone -- the one
+    // place that writes profiles.Default.zones[path] in the persisted
+    // plugin config. An empty zones array is a legitimate "no alarm on
+    // this path" end state, not an error: it deletes the path's entry
+    // entirely rather than leaving a stale empty array behind, so GET
+    // /config's stored profile genuinely shows no trace of a path that's
+    // been fully cleared.
+    function persistZonesForPath(path, zones, cb) {
+      const options = app.readPluginOptions() || {};
+      const configuration = options.configuration || {};
+      if (!configuration.profiles) configuration.profiles = {};
+      if (!configuration.profiles.Default) configuration.profiles.Default = { zones: {}, sounds: {} };
+      if (!configuration.profiles.Default.zones) configuration.profiles.Default.zones = {};
+      if (zones.length === 0) {
+        delete configuration.profiles.Default.zones[path];
+      } else {
+        configuration.profiles.Default.zones[path] = zones;
+      }
+      app.savePluginOptions(configuration, cb);
+    }
+
+    // Shape normalization only (message/lower/upper trimmed to defined
+    // values, per the meta.zones shape) -- not the "does this zone make
+    // sense" validation, which only /commit-zone does (see below): a path
+    // whose live meta already has some odd-shaped zone entry from another
+    // tool shouldn't make "Get live" itself fail, since it's just honestly
+    // reflecting what's actually live, not enforcing our own UI's rules on
+    // someone else's data.
+    function normalizeZones(zones) {
+      return zones.map((zone) => {
+        const entry = { state: zone.state };
+        if (typeof zone.lower === 'number' && Number.isFinite(zone.lower)) entry.lower = zone.lower;
+        if (typeof zone.upper === 'number' && Number.isFinite(zone.upper)) entry.upper = zone.upper;
+        if (zone.message) entry.message = zone.message;
+        return entry;
+      });
+    }
+
     router.get('/paths', (req, res) => {
       res.json(app.streambundle.getAvailablePaths());
     });
@@ -113,11 +153,14 @@ module.exports = function (app) {
         res.status(400).json({ error: 'path is required' });
         return;
       }
-      if (!Array.isArray(zones) || zones.length === 0) {
-        res.status(400).json({ error: 'zones must be a non-empty array' });
+      // An empty array is a legitimate "clear every zone from this path"
+      // request (no alarm wanted here), not an error -- only require the
+      // array to exist. Validation below only runs over whatever zones ARE
+      // present in it, so it can't block a genuinely empty submission.
+      if (!Array.isArray(zones)) {
+        res.status(400).json({ error: 'zones must be an array' });
         return;
       }
-      const validStates = ['nominal', 'alert', 'warn', 'alarm', 'emergency'];
       for (const zone of zones) {
         if (!validStates.includes(zone.state)) {
           res.status(400).json({ error: 'invalid state: ' + zone.state });
@@ -131,14 +174,14 @@ module.exports = function (app) {
         }
       }
 
-      const cleanZones = zones.map((zone) => {
-        const entry = { state: zone.state };
-        if (typeof zone.lower === 'number' && Number.isFinite(zone.lower)) entry.lower = zone.lower;
-        if (typeof zone.upper === 'number' && Number.isFinite(zone.upper)) entry.upper = zone.upper;
-        if (zone.message) entry.message = zone.message;
-        return entry;
-      });
+      const cleanZones = normalizeZones(zones);
 
+      // Writes meta.zones directly -- server core's own native zone watcher
+      // does the actual enforcement (see CLAUDE.md "Architecture"/"Data
+      // model"). An empty array here clears any previous zones for this
+      // path (core treats an empty tests list as "everything falls in the
+      // implicit normal gap" -- confirmed against its source, functionally
+      // equivalent to no alarm).
       app.handleMessage(plugin.id, {
         context: 'vessels.' + app.selfId,
         updates: [
@@ -149,21 +192,44 @@ module.exports = function (app) {
         ]
       });
 
-      // app.readPluginOptions().configuration is our data blob directly
-      // (see the savePluginOptions gotcha in CLAUDE.md) -- read fresh here
-      // rather than trusting whatever start()'s closure last saw, since this
-      // route can run long after start() without another restart.
-      const options = app.readPluginOptions() || {};
-      const configuration = options.configuration || {};
-      if (!configuration.profiles) configuration.profiles = {};
-      if (!configuration.profiles.Default) configuration.profiles.Default = { zones: {}, sounds: {} };
-      if (!configuration.profiles.Default.zones) configuration.profiles.Default.zones = {};
-      configuration.profiles.Default.zones[path] = cleanZones;
-
-      app.savePluginOptions(configuration, (err) => {
+      persistZonesForPath(path, cleanZones, (err) => {
         if (err) {
           console.error(err);
           res.status(500).json({ error: 'meta written but failed to save profile: ' + err.message });
+          return;
+        }
+        res.json({ ok: true, zones: cleanZones });
+      });
+    });
+
+    // Get Live's persistence step (see CLAUDE.md "Stored state vs. live:
+    // sync philosophy" and the revised "Get live" decision under "Tab 1 —
+    // Zones"): writes a zones array (read by the caller from GET
+    // /live-meta) straight into the stored profile via the same
+    // persistZonesForPath() helper /commit-zone uses -- deliberately does
+    // NOT touch meta or call app.handleMessage at all. Get Live reads live,
+    // writes stored + draft, nothing else; Commit remains the only thing
+    // that writes to the live server.
+    router.post('/persist-zone', (req, res) => {
+      const body = req.body || {};
+      const path = body.path;
+      const zones = body.zones;
+
+      if (!path || typeof path !== 'string') {
+        res.status(400).json({ error: 'path is required' });
+        return;
+      }
+      if (!Array.isArray(zones)) {
+        res.status(400).json({ error: 'zones must be an array' });
+        return;
+      }
+
+      const cleanZones = normalizeZones(zones);
+
+      persistZonesForPath(path, cleanZones, (err) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'failed to save profile: ' + err.message });
           return;
         }
         res.json({ ok: true, zones: cleanZones });

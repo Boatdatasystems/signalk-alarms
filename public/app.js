@@ -46,6 +46,7 @@ let liveValueError = null;
 // on the same path is normal), so the draft is a list, not a single triple.
 let draftZones = [];
 let commitStatus = null; // {type: 'pending'|'success'|'error', message}
+let liveSyncStatus = null; // {type: 'pending'|'error', message} -- Get live's own status, separate from Commit's
 
 function emptyDraftZone() {
   return { lower: '', upper: '', state: 'alarm' };
@@ -249,6 +250,7 @@ function renderZonesList() {
       // live value readout (that part was already working correctly).
       draftZones = zonesToDraft(defaultProfileZones[path]);
       commitStatus = null;
+      liveSyncStatus = null;
       closeLiveValueSocket();
       if (expandedPath) {
         liveValueSocket = openLiveValueSocket(expandedPath);
@@ -275,25 +277,52 @@ function renderZonesList() {
       const liveBtn = document.createElement('button');
       liveBtn.type = 'button';
       liveBtn.className = 'get-live-btn';
-      liveBtn.textContent = 'Get live';
-      liveBtn.addEventListener('click', () => {
-        liveBtn.disabled = true;
-        liveBtn.textContent = 'Loading...';
-        fetch('/plugins/signalk-alarms/live-meta?path=' + encodeURIComponent(path))
-          .then((r) => r.json())
-          .then((data) => {
-            liveZones = data.zones;
-            liveFetchError = null;
-            // Per the "Get live" decision in CLAUDE.md: overwrites the
-            // editable list too, uncommitted and freely overwritable, no
-            // confirmation needed -- nothing's live until Commit anyway.
-            draftZones = zonesToDraft(data.zones);
-            renderZonesList();
-          })
-          .catch((err) => {
-            liveFetchError = err.message;
-            renderZonesList();
+      liveBtn.disabled = !!(liveSyncStatus && liveSyncStatus.type === 'pending');
+      liveBtn.textContent = liveSyncStatus && liveSyncStatus.type === 'pending' ? 'Loading...' : 'Get live';
+      liveBtn.addEventListener('click', async () => {
+        liveSyncStatus = { type: 'pending', message: 'Syncing from live...' };
+        renderZonesList();
+        try {
+          const liveRes = await fetch('/plugins/signalk-alarms/live-meta?path=' + encodeURIComponent(path));
+          const liveData = await liveRes.json();
+          if (!liveRes.ok) throw new Error(liveData.error || 'Failed to fetch live data');
+
+          liveZones = liveData.zones;
+          liveFetchError = null;
+          // Per the "Get live" decision in CLAUDE.md: overwrites the
+          // editable list too, uncommitted and freely overwritable, no
+          // confirmation needed -- nothing's live until Commit anyway.
+          draftZones = zonesToDraft(liveData.zones);
+          renderZonesList();
+
+          // REVISED per CLAUDE.md "Stored state vs. live: sync philosophy":
+          // Get live now also writes straight through to the stored
+          // profile, not just the draft. Deliberately a separate call from
+          // the live read above -- /persist-zone only ever writes
+          // profiles.Default.zones[path] (the same stored-config write
+          // Commit does, via the same backend persistZonesForPath()
+          // helper), it never touches meta or calls app.handleMessage.
+          // Get live reads live, writes stored + draft, nothing else.
+          const persistRes = await fetch('/plugins/signalk-alarms/persist-zone', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: path, zones: liveData.zones || [] })
           });
+          const persistData = await persistRes.json();
+          if (!persistRes.ok) throw new Error(persistData.error || 'Failed to save synced zones to stored profile');
+
+          // Keep the local cache in sync with what the server just
+          // persisted, so the mini bar and a later collapse/re-expand of
+          // this row (which reads from defaultProfileZones, not liveZones)
+          // reflect it without a full page reload.
+          defaultProfileZones[path] = persistData.zones;
+          liveSyncStatus = null;
+          renderZonesList();
+        } catch (err) {
+          liveFetchError = err.message;
+          liveSyncStatus = null;
+          renderZonesList();
+        }
       });
 
       toolbar.appendChild(label);
@@ -412,14 +441,12 @@ function renderZonesList() {
           const upper = upperText === '' ? undefined : Number(upperText);
           // A row left fully blank (e.g. an unused "Add zone" row) is just
           // not-yet-used, not an error -- skip it silently rather than
-          // rejecting the whole commit over it.
+          // rejecting the whole commit over it. A genuinely empty list
+          // (every zone removed) is itself a legitimate end state -- "no
+          // alarm on this path" -- and commits successfully, clearing
+          // meta.zones and the stored profile's entry for this path.
           if (lower === undefined && upper === undefined) continue;
           zonesToSend.push({ lower: lower, upper: upper, state: zone.state });
-        }
-        if (zonesToSend.length === 0) {
-          commitStatus = { type: 'error', message: 'Add at least one zone with a lower or upper bound.' };
-          renderZonesList();
-          return;
         }
         commitStatus = { type: 'pending', message: 'Committing...' };
         renderZonesList();

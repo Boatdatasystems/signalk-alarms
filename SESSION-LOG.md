@@ -291,4 +291,54 @@ Verified: zero browser console messages, zero new `signalk.service` log errors,
 changed).
 
 ---
+
+**Fix remove-all-zones validation; Get live persists to stored profile**
+
+Asked for: two independent fixes, don't conflate them. (1) committing an empty zones list
+(every row removed) errors instead of succeeding -- clearing a path should be a legitimate
+action. (2) per the revised CLAUDE.md decision, "Get live" should now write the path's live
+zones into the stored profile, not just the row's draft -- read live, write stored + draft,
+never touch the live server itself.
+
+Fix 1:
+```
+/commit-zone: only requires zones to be an array (was: non-empty array)
+persistZonesForPath(): zones.length === 0 -> delete the path's key, not store []
+```
+Fix 2:
+```
+new POST /persist-zone {path, zones} -> persistZonesForPath(), no app.handleMessage call
+frontend Get Live: GET /live-meta (read) then POST /persist-zone (persist), two calls
+```
+
+Extracted `persistZonesForPath()` and `normalizeZones()` as shared helpers -- no such helper
+existed before this session, the profile-merge-and-save logic was inline in `/commit-zone`
+only. Both new/changed routes call it. Flagged as asked: this is also where the two fixes
+turned out more entangled than presented -- Fix 1's "empty array deletes the key" behavior
+lives in the shared helper, so Fix 2's route inherits it automatically when Get Live finds a
+path with no live zones at all. Not a design decision made up front; it fell out of sharing the
+helper and turned out to be correct for both callers, but worth stating plainly rather than
+letting it look like two fully independent changes.
+
+Verified against the actual deployed Pi:
+- Fix 1, twice: via direct API (commit a zone, commit `[]`, confirm `meta.zones: []` and no
+  stored key via `GET /config`) and through the real UI (Remove button to zero rows, Commit,
+  same result).
+- Fix 2: injected a live-only zone via WS meta delta, clicked "Get live," confirmed the stored
+  profile actually updated (checked the config API directly, not just the browser display),
+  collapsed/re-expanded the row without touching Commit and saw the synced data on open, then
+  typed an unsaved draft edit, injected a *different* live value, clicked "Get live" again, and
+  confirmed the unsaved draft was discarded in favor of the new live data -- while a second,
+  unrelated path's data was untouched throughout.
+
+Flagged, not silently worked around: a stale element reference from the browser `find` tool,
+reused across two re-renders, caused one test click to land on the wrong row (`test.test2`
+instead of `test.test`) mid-session -- caught immediately by checking server state directly
+rather than trusting what the UI showed, not a product bug.
+
+Verified: zero browser console messages, zero new `signalk.service` log errors.
+`signalk.service` needed one restart this time (backend `index.js` changed, unlike last
+session's frontend-only fixes) and came back healthy immediately.
+
+---
 *Appended as sessions complete and results come back.*
