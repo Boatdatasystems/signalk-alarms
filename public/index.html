@@ -35,7 +35,21 @@
       </div>
     </section>
     <section id="tab-notifications" class="tab-panel">
-      <p class="placeholder">Notification sound bindings coming soon.</p>
+      <div class="notif-default-bar">
+        <label for="notif-default-sound">Default sound (used when a notification's path/state isn't mapped below)</label>
+        <select id="notif-default-sound">
+          <option value="">(none configured)</option>
+        </select>
+        <button id="notif-refresh-sounds-btn" type="button">Refresh list</button>
+      </div>
+      <div id="notif-rows" class="notif-rows">
+        <p class="placeholder">Loading notification config...</p>
+      </div>
+      <button id="notif-add-row-btn" type="button" class="add-zone-btn">Add path/state binding</button>
+      <div class="notif-save-section">
+        <button id="notif-save-btn" type="button" class="commit-btn">Save</button>
+        <span id="notif-save-status" class="commit-status"></span>
+      </div>
     </section>
   </main>
 

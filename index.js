@@ -1,3 +1,7 @@
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
 module.exports = function (app) {
   const plugin = {};
 
@@ -11,6 +15,191 @@ module.exports = function (app) {
     type: 'object',
     properties: {}
   };
+
+  // --- Notifications tab: sound playback state -------------------------
+  // Module-scope (shared by plugin.start/stop and the router below), not
+  // function-local -- plugin.start/stop can each run more than once against
+  // the same plugin instance (enable/disable from the admin UI, a config
+  // save that re-registers, etc.) without a full process restart, so this
+  // must be reset on every start() and fully torn down on every stop() --
+  // see the "Clean up properly" requirement.
+  let notificationUnsubscribes = [];
+  // path -> intervalId for a currently-repeating alarm. Keyed per PATH, not
+  // per path+state: a path can only be in one state at a time, so a state
+  // transition (e.g. warn -> alarm) must replace whatever repeat was
+  // running for that path, never run two at once for the same path.
+  let activeRepeats = new Map();
+  // path -> last known non-derived state string ('alert'/'warn'/'alarm'/
+  // 'emergency'/'normal'/'nominal'). Lets a genuine state transition be told
+  // apart from a duplicate delta at the same state (e.g. a message/value-only
+  // republish with no real change) -- the latter must not restart playback
+  // or reset an in-progress repeat interval. Absent from this map (the
+  // bootstrap replay of an alarm already active when the plugin started)
+  // is deliberately treated as a fresh transition, so a restart doesn't go
+  // silent on an alarm that was already sounding.
+  let lastKnownState = new Map();
+
+  // Single serial playback queue shared across every path/state -- mirrors
+  // pi-deck-tools' apps/alerts/audio.py (mcd's own critical-alert player,
+  // confirmed by reading its source on the Pi): several alarms firing at
+  // once used to spawn overlapping players there too, turning into
+  // unintelligible noise, fixed with exactly this one-queue/one-worker
+  // pattern. Reused here instead of re-deriving it independently.
+  let playQueue = [];
+  let playing = false;
+  const PLAYBACK_TIMEOUT_MS = 30000; // matches audio.py's play_wav_once timeout
+
+  function soundsDir() {
+    return path.join(app.getDataDirPath(), 'sounds');
+  }
+
+  // Confirmed by reading /etc/systemd/system/mcd.service on the Pi: mcd.py's
+  // own working paplay invocation runs as a systemd service (User=pi, no
+  // interactive login session) with Environment=XDG_RUNTIME_DIR=/run/user/1000
+  // set explicitly -- without it, paplay/PipeWire can't find the user's audio
+  // session from a bare systemd unit. signalk.service (also User=pi) does
+  // NOT set this env var, so it must be supplied here rather than assumed
+  // present. Computed from the running process's own uid rather than
+  // hardcoding 1000, so this stays correct if this plugin is ever deployed
+  // under a different account -- falls through to leaving it unset (paplay
+  // will then fail the same way it would without this fix) on a platform
+  // with no process.getuid (Windows dev/test boxes), rather than throwing.
+  function xdgRuntimeDir() {
+    if (process.env.XDG_RUNTIME_DIR) return process.env.XDG_RUNTIME_DIR;
+    if (typeof process.getuid === 'function') return '/run/user/' + process.getuid();
+    return undefined;
+  }
+
+  // Plays sound files one at a time via `paplay --volume=65536` -- NOT
+  // aplay. Checked the codebase/Pi for an established playback mechanism
+  // first, per the task's own instruction to reuse rather than pick
+  // independently: pi-deck-tools/apps/alerts/audio.py (mcd's critical-alert
+  // player) already uses this exact invocation, with a comment noting it's
+  // "already proven to work reliably on this hardware (PipeWire/HiFiBerry)"
+  // -- stronger, hardware-specific evidence than CLAUDE.md's earlier,
+  // never-implemented "use aplay" guess. A 30s kill-timeout mirrors that same
+  // file's play_wav_once() (subprocess.run(..., timeout=30)) -- a hung
+  // paplay process would otherwise jam this queue for every future alarm,
+  // not just the one that hung, which is its own failure-path hazard per
+  // CLAUDE.md's gotchas about backoff on the failure path, not just the
+  // success path.
+  function pumpPlayQueue() {
+    if (playing || playQueue.length === 0) return;
+    playing = true;
+    const filename = playQueue.shift();
+    const soundPath = path.join(soundsDir(), filename);
+    const env = Object.assign({}, process.env);
+    const rt = xdgRuntimeDir();
+    if (rt) env.XDG_RUNTIME_DIR = rt;
+
+    let child;
+    try {
+      child = spawn('paplay', ['--volume=65536', soundPath], { env: env });
+    } catch (err) {
+      app.debug('signalk-alarms: failed to spawn paplay for ' + filename + ': ' + err.message);
+      playing = false;
+      pumpPlayQueue();
+      return;
+    }
+
+    const timeoutTimer = setTimeout(() => {
+      app.debug('signalk-alarms: paplay timed out playing ' + filename + ', killing');
+      child.kill();
+    }, PLAYBACK_TIMEOUT_MS);
+
+    child.on('error', (err) => {
+      // e.g. ENOENT if paplay isn't installed -- log and move on, same as
+      // audio.py's play_wav_once does (returns False, doesn't raise).
+      app.debug('signalk-alarms: paplay error playing ' + filename + ': ' + err.message);
+    });
+
+    child.on('close', () => {
+      clearTimeout(timeoutTimer);
+      playing = false;
+      pumpPlayQueue();
+    });
+  }
+
+  function queuePlay(filename) {
+    if (!filename) return;
+    playQueue.push(filename);
+    pumpPlayQueue();
+  }
+
+  function stopRepeatFor(path) {
+    const timer = activeRepeats.get(path);
+    if (timer) {
+      clearInterval(timer);
+      activeRepeats.delete(path);
+    }
+  }
+
+  function getNotificationsConfig() {
+    const options = app.readPluginOptions() || {};
+    const configuration = options.configuration || {};
+    return {
+      notifications: configuration.notifications || {},
+      defaultSound: configuration.defaultSound || null
+    };
+  }
+
+  // Looks up config.notifications[path][state] and plays/repeats
+  // accordingly; falls back to config.defaultSound (played once, never
+  // repeated) when the path isn't configured at all, or is configured but
+  // this specific state has no mapping -- per the task's explicit "don't
+  // silently do nothing" requirement.
+  function handleNotificationState(notifPath, state) {
+    const previous = lastKnownState.get(notifPath);
+    lastKnownState.set(notifPath, state);
+
+    if (state === 'normal' || state === 'nominal') {
+      stopRepeatFor(notifPath);
+      return;
+    }
+
+    // Duplicate delta at the same already-alarming state (e.g. a
+    // message/value-only republish with no real state change) -- must not
+    // restart playback or reset an in-progress repeat interval. A missing
+    // `previous` (nothing seen yet for this path -- including the bootstrap
+    // replay of an alarm already active when the plugin started) is NOT
+    // treated as a duplicate, so a plugin restart doesn't go silent on an
+    // alarm that's already sounding.
+    if (previous === state) return;
+
+    stopRepeatFor(notifPath);
+
+    const { notifications, defaultSound } = getNotificationsConfig();
+    const stateConfig = notifications[notifPath] && notifications[notifPath][state];
+
+    if (stateConfig && stateConfig.sound) {
+      queuePlay(stateConfig.sound);
+      if (stateConfig.mode === 'repeat') {
+        const intervalMs = Math.max(1, Number(stateConfig.intervalSeconds) || 30) * 1000;
+        activeRepeats.set(
+          notifPath,
+          setInterval(() => queuePlay(stateConfig.sound), intervalMs)
+        );
+      }
+    } else if (defaultSound) {
+      queuePlay(defaultSound);
+    }
+  }
+
+  // Deltas from app.subscriptionmanager arrive in the standard delta shape
+  // ({context, updates: [{values: [{path, value}]}]}) -- confirmed against
+  // signalk-server's own streambundle.js (toDelta()) and subscriptionmanager.js
+  // on the Pi, not assumed. A notification's value is an object with a
+  // `state` field; meta-type updates (no `values`) and any value without a
+  // `state` are not notifications and are ignored.
+  function handleNotificationDelta(delta) {
+    (delta.updates || []).forEach((update) => {
+      (update.values || []).forEach((pathValue) => {
+        const value = pathValue.value;
+        if (!pathValue.path || !value || typeof value !== 'object' || !value.state) return;
+        handleNotificationState(pathValue.path, value.state);
+      });
+    });
+  }
 
   plugin.start = function (options) {
     app.debug('signalk-alarms starting');
@@ -36,17 +225,75 @@ module.exports = function (app) {
       changed = true;
     }
 
+    // Notifications tab config: plugin-owned JSON, top-level (not nested
+    // under a profile) per this session's explicit design -- a path's sound
+    // bindings apply the same way regardless of which zones profile is
+    // active. `data.defaultSound === undefined` (not falsy) is the seed
+    // check, since '' or null are both legitimate "not configured yet"
+    // values once the user has actually saved the Notifications tab once
+    // (e.g. cleared it back out) -- only truly absent (never saved) should
+    // be seeded.
+    if (!data.notifications) {
+      data.notifications = {};
+      changed = true;
+    }
+    if (data.defaultSound === undefined) {
+      data.defaultSound = null;
+      changed = true;
+    }
+
     if (changed) {
       app.savePluginOptions(data, () => {
-        app.debug('signalk-alarms: initialized pathSettings/profiles store');
+        app.debug('signalk-alarms: initialized pathSettings/profiles/notifications store');
       });
     }
+
+    // Reset per-start state -- plugin.start()/stop() can each run more than
+    // once against this same instance (e.g. disabling/re-enabling from the
+    // admin UI) without a full process restart, so a leftover repeat timer
+    // or stale last-known-state from a previous start() must not survive
+    // into this one.
+    notificationUnsubscribes = [];
+    activeRepeats = new Map();
+    lastKnownState = new Map();
+    playQueue = [];
+    playing = false;
+
+    // Subscribes broadly to notifications.* via app.subscriptionmanager (not
+    // a raw app.handleMessage listener, not polling) -- confirmed against
+    // subscriptionmanager.js on the Pi that this also bootstraps from the
+    // delta cache on subscribe, replaying the last known delta for every
+    // notification path that already has one. That's desirable here, not
+    // just incidental: it means an alarm already active when the plugin
+    // starts (e.g. a restart while notifications.navigation.anchor is mid-
+    // alarm) is picked up and sounded immediately, not silently missed
+    // until its next state change.
+    app.subscriptionmanager.subscribe(
+      { context: 'vessels.self', subscribe: [{ path: 'notifications.*' }] },
+      notificationUnsubscribes,
+      (err) => {
+        app.debug('signalk-alarms: notification subscription error: ' + err);
+      },
+      handleNotificationDelta
+    );
 
     app.debug('signalk-alarms started');
   };
 
   plugin.stop = function () {
     app.debug('signalk-alarms stopping');
+    // Clean up properly: unsubscribe from notifications.*, clear every
+    // active repeat timer, and drop any queued-but-not-yet-played sound --
+    // otherwise a restart leaves orphaned timers running (each still holding
+    // a reference to this closure, so they'd keep firing against a plugin
+    // instance that's supposedly stopped) or doubles up playback once
+    // plugin.start() subscribes again.
+    notificationUnsubscribes.forEach((unsubscribe) => unsubscribe());
+    notificationUnsubscribes = [];
+    activeRepeats.forEach((timer) => clearInterval(timer));
+    activeRepeats.clear();
+    lastKnownState.clear();
+    playQueue = [];
   };
 
   // Mounted by the server at /plugins/signalk-alarms/* — see
@@ -133,17 +380,27 @@ module.exports = function (app) {
     // populated one. Node shape confirmed too: {value, $source, timestamp,
     // meta}; value can be a number, string, object, or absent entirely for a
     // path that's never reported data.
-    // Real, working Commit: writes meta.zones directly via app.handleMessage.
-    // SignalK server core unconditionally instantiates its own native Zones
-    // watcher at startup (dist/zones.js: `new Zones(app.streambundle, ...)`)
-    // that watches every path's meta.zones and fires real
-    // notifications.<path> deltas on crossing -- confirmed empirically
-    // against both signalk-server 2.32.0 and the Pi's actual installed
-    // 2.31.1. No @signalk/zones ("zones-edit") plugin involvement needed or
-    // wanted -- see CLAUDE.md "Architecture"/"Data model" for the
-    // double-notification bug that combination caused. Also updates the
-    // active profile's stored zones[path] to match, so it survives a
-    // restart and "Get live" continues to agree with what's stored.
+    // Real, working Commit: writes meta.zones via app.putSelfPath(), NOT
+    // app.handleMessage(). handleMessage() only publishes a delta into the
+    // live data model -- it updates what the Data Browser shows and feeds
+    // signalk-server core's own native Zones watcher (dist/zones.js: `new
+    // Zones(app.streambundle, ...)`, which fires real notifications.<path>
+    // deltas on crossing, confirmed against both 2.32.0 and the Pi's
+    // 2.31.1) -- but it never writes to disk. A zone committed this way
+    // looked saved and evaluated live, but silently vanished on the next
+    // signalk-server restart. app.putSelfPath(path, value, cb, source), for
+    // a path ending in `.meta`/`.meta.<field>`, instead routes through the
+    // server's actual PUT pipeline (putMetaHandler) -- the same code path
+    // the admin UI's own "Edit Metadata -> Save" button uses -- which
+    // updates live state AND calls writeBaseDeltasFile(app), persisting
+    // into ~/.signalk/baseDeltas.json. Targeting `.meta.zones` specifically
+    // (not `.meta` as a whole) merges into the existing meta object
+    // server-side, so units/description/displayUnits already set on this
+    // path survive untouched. No @signalk/zones ("zones-edit") plugin
+    // involvement needed or wanted -- see CLAUDE.md "Architecture"/"Data
+    // model" for the double-notification bug that combination caused. Also
+    // updates the active profile's stored zones[path] to match, so "Get
+    // live" continues to agree with what's stored.
     router.post('/commit-zone', (req, res) => {
       const body = req.body || {};
       const path = body.path;
@@ -175,31 +432,48 @@ module.exports = function (app) {
       }
 
       const cleanZones = normalizeZones(zones);
+      let responded = false;
 
-      // Writes meta.zones directly -- server core's own native zone watcher
-      // does the actual enforcement (see CLAUDE.md "Architecture"/"Data
-      // model"). An empty array here clears any previous zones for this
-      // path (core treats an empty tests list as "everything falls in the
-      // implicit normal gap" -- confirmed against its source, functionally
-      // equivalent to no alarm).
-      app.handleMessage(plugin.id, {
-        context: 'vessels.' + app.selfId,
-        updates: [
-          {
-            source: { label: plugin.id },
-            meta: [{ path: path, value: { zones: cleanZones } }]
+      // Real PUT through the server's actual pipeline (see the comment
+      // above this route) so the write survives a restart. An empty array
+      // here clears any previous zones for this path -- the server itself
+      // converts an empty zones array to null before saving, and core's
+      // native watcher treats a null/empty test list as "everything falls
+      // in the implicit normal gap", functionally equivalent to no alarm.
+      // putSelfPath's callback can fire more than once for a single PUT
+      // (PENDING, then a terminal state) -- only PENDING is real "no error
+      // thrown yet", not success, so it's explicitly ignored here rather
+      // than treated as a response. Only a terminal COMPLETED with a
+      // non-error statusCode counts as success; anything else (a
+      // permission/validation FAILED, or a non-2xx statusCode) is surfaced
+      // to the caller as a real failure instead of silently looking saved.
+      app.putSelfPath(
+        path + '.meta.zones',
+        cleanZones,
+        (result) => {
+          if (responded) return;
+          if (!result || result.state === 'PENDING') return;
+          if (result.state !== 'COMPLETED' || result.statusCode >= 300) {
+            responded = true;
+            res.status(502).json({
+              error:
+                'failed to write zones to server: ' +
+                (result.message || result.state || ('status ' + result.statusCode))
+            });
+            return;
           }
-        ]
-      });
-
-      persistZonesForPath(path, cleanZones, (err) => {
-        if (err) {
-          console.error(err);
-          res.status(500).json({ error: 'meta written but failed to save profile: ' + err.message });
-          return;
-        }
-        res.json({ ok: true, zones: cleanZones });
-      });
+          responded = true;
+          persistZonesForPath(path, cleanZones, (err) => {
+            if (err) {
+              console.error(err);
+              res.status(500).json({ error: 'meta written but failed to save profile: ' + err.message });
+              return;
+            }
+            res.json({ ok: true, zones: cleanZones });
+          });
+        },
+        plugin.id
+      );
     });
 
     // Get Live's persistence step (see CLAUDE.md "Stored state vs. live:
@@ -271,6 +545,149 @@ module.exports = function (app) {
         values[path] = node && Object.prototype.hasOwnProperty.call(node, 'value') ? node.value : undefined;
       });
       res.json(values);
+    });
+
+    // Lists the actual .wav files present in the sounds directory on disk --
+    // the Notifications tab's dropdown is populated from this, never a
+    // hardcoded list, per the same "typo'd path here is a real failure mode"
+    // reasoning CLAUDE.md already applies to the Zones tab's sound picker.
+    // The directory itself is created by hand on the Pi, not by this plugin
+    // (see CLAUDE.md/task instructions) -- ENOENT here just means "no sounds
+    // added yet", an empty list, not an error.
+    router.get('/sounds', (req, res) => {
+      fs.readdir(soundsDir(), (err, files) => {
+        if (err) {
+          if (err.code === 'ENOENT') {
+            res.json({ sounds: [] });
+            return;
+          }
+          console.error(err);
+          res.status(500).json({ error: 'failed to list sounds: ' + err.message });
+          return;
+        }
+        const sounds = files.filter((f) => f.toLowerCase().endsWith('.wav')).sort();
+        res.json({ sounds: sounds });
+      });
+    });
+
+    const validNotificationStates = ['alert', 'warn', 'alarm', 'emergency'];
+    const validPlaybackModes = ['once', 'repeat'];
+
+    // Saves the whole Notifications tab config in one shot -- notifications
+    // (path -> state -> {sound, mode, intervalSeconds}) and defaultSound.
+    // Unlike the Zones tab's zones (which reconcile against a live "Server"
+    // copy via Get Live/Commit/Refresh/Send-to-server), this is plugin-owned
+    // config with nothing else to reconcile against, so there's no per-path
+    // merge step here the way persistZonesForPath has for zones -- the
+    // submitted notifications object simply replaces the stored one
+    // wholesale, same as any plain settings form. Deliberately does NOT
+    // reuse the server's generic POST /plugins/<id>/config (which restarts
+    // the plugin on every save, per CLAUDE.md's gotcha about that route) --
+    // a restart on every Notifications-tab save would tear down the live
+    // notification subscription and any in-progress repeat timers/queued
+    // sounds for no reason, since app.savePluginOptions() (used here, same
+    // as every other route in this file) already persists without one.
+    router.post('/notification-config', (req, res) => {
+      const body = req.body || {};
+      const notifications = body.notifications;
+      const defaultSound = body.defaultSound;
+
+      if (!notifications || typeof notifications !== 'object' || Array.isArray(notifications)) {
+        res.status(400).json({ error: 'notifications must be an object' });
+        return;
+      }
+
+      let availableSounds;
+      try {
+        availableSounds = new Set(
+          fs
+            .readdirSync(soundsDir())
+            .filter((f) => f.toLowerCase().endsWith('.wav'))
+        );
+      } catch (err) {
+        availableSounds = new Set();
+      }
+
+      // Defense in depth, not the only check -- the frontend dropdown is
+      // already populated from GET /sounds so a normal save can't submit an
+      // unknown filename, but a typo'd/stale sound reference here is exactly
+      // the "looks configured, silently does nothing at alarm time" failure
+      // mode this whole picker-not-freehand-textbox approach exists to rule
+      // out (same reasoning CLAUDE.md already applies to the Zones tab).
+      function soundError(sound, context) {
+        if (!sound || typeof sound !== 'string') return 'missing sound file for ' + context;
+        if (!availableSounds.has(sound)) {
+          return "sound file '" + sound + "' not found in sounds directory (" + context + ')';
+        }
+        return null;
+      }
+
+      if (defaultSound !== null && defaultSound !== undefined && defaultSound !== '') {
+        const err = soundError(defaultSound, 'defaultSound');
+        if (err) {
+          res.status(400).json({ error: err });
+          return;
+        }
+      }
+
+      const cleanNotifications = {};
+      for (const notifPath of Object.keys(notifications)) {
+        const stateMap = notifications[notifPath];
+        if (!stateMap || typeof stateMap !== 'object' || Array.isArray(stateMap)) {
+          res.status(400).json({ error: 'invalid state map for path ' + notifPath });
+          return;
+        }
+        const cleanStates = {};
+        for (const state of Object.keys(stateMap)) {
+          if (!validNotificationStates.includes(state)) {
+            res.status(400).json({ error: 'invalid state "' + state + '" for path ' + notifPath });
+            return;
+          }
+          const entry = stateMap[state] || {};
+          const err = soundError(entry.sound, notifPath + '/' + state);
+          if (err) {
+            res.status(400).json({ error: err });
+            return;
+          }
+          if (!validPlaybackModes.includes(entry.mode)) {
+            res.status(400).json({ error: 'invalid mode for ' + notifPath + '/' + state });
+            return;
+          }
+          const clean = { sound: entry.sound, mode: entry.mode };
+          if (entry.mode === 'repeat') {
+            const interval = Number(entry.intervalSeconds);
+            // >= 1s minimum: an unbounded-small interval here is the same
+            // family of bug as signalk-notification-player's retry-storm
+            // gotcha in CLAUDE.md (a failure/repeat path with no floor on
+            // its own cadence pegged the Pi) -- our repeat is timer-driven
+            // rather than retry-on-failure, but a 0 or fractional-second
+            // interval would recreate the same shape of problem.
+            if (!Number.isFinite(interval) || interval < 1) {
+              res.status(400).json({ error: 'intervalSeconds must be a number >= 1 for ' + notifPath + '/' + state });
+              return;
+            }
+            clean.intervalSeconds = interval;
+          }
+          cleanStates[state] = clean;
+        }
+        if (Object.keys(cleanStates).length > 0) {
+          cleanNotifications[notifPath] = cleanStates;
+        }
+      }
+
+      const options = app.readPluginOptions() || {};
+      const configuration = options.configuration || {};
+      configuration.notifications = cleanNotifications;
+      configuration.defaultSound = defaultSound || null;
+
+      app.savePluginOptions(configuration, (err) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'failed to save notification config: ' + err.message });
+          return;
+        }
+        res.json({ ok: true, notifications: cleanNotifications, defaultSound: configuration.defaultSound });
+      });
     });
   };
 

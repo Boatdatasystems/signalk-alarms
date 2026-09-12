@@ -438,3 +438,79 @@ body {
 .refresh-status-pending, .send-status-checking { color: #666; }
 .refresh-status-success, .send-status-success, .send-status-none { color: #2e7d32; }
 .refresh-status-error, .send-status-error { color: #c62828; }
+
+/* --- Notifications tab -------------------------------------------------- */
+
+.notif-default-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid #ddd;
+  flex-wrap: wrap;
+}
+
+.notif-default-bar label {
+  font-size: 0.85rem;
+  color: #444;
+}
+
+.notif-default-bar select {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.notif-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+
+.notif-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background: #fff;
+  flex-wrap: wrap;
+}
+
+.notif-path-input {
+  flex: 1;
+  min-width: 16rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  font-family: monospace;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.notif-row select {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.notif-interval-input {
+  width: 6rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.85rem;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+}
+
+.notif-save-section {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px dashed #ddd;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}

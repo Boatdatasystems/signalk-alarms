@@ -1106,3 +1106,285 @@ document.getElementById('zones-search').addEventListener('input', renderZonesLis
 document.getElementById('zones-source-filter').addEventListener('change', renderZonesList);
 
 loadZonesTab();
+
+// --- Notifications tab ---
+//
+// Plugin-owned config only (path -> state -> {sound, mode, intervalSeconds},
+// plus a single top-level defaultSound) -- NOT SignalK path metadata, so
+// unlike the Zones tab there's no Server/Profile split, no Get Live/Commit/
+// Refresh/Send-to-server: just one editable list and one Save button, same
+// as any plain settings form. See index.js's /notification-config route for
+// why this posts there rather than the generic POST /plugins/<id>/config.
+
+let notifRows = [];
+let availableSounds = [];
+let notifDefaultSound = '';
+let notifSaveStatus = null; // {type: 'pending'|'success'|'error', message}
+
+const NOTIF_STATES = ['alert', 'warn', 'alarm', 'emergency'];
+const NOTIF_MODES = ['once', 'repeat'];
+
+function emptyNotifRow() {
+  return { path: '', state: 'alert', sound: '', mode: 'once', intervalSeconds: 30 };
+}
+
+// Flattens the stored {path: {state: {sound,mode,intervalSeconds}}} shape
+// into one row per path+state binding -- easier to render/edit as a flat
+// list than as nested selects.
+function configToNotifRows(notifications) {
+  const rows = [];
+  Object.keys(notifications || {}).forEach((path) => {
+    const stateMap = notifications[path] || {};
+    Object.keys(stateMap).forEach((state) => {
+      const entry = stateMap[state] || {};
+      rows.push({
+        path: path,
+        state: state,
+        sound: entry.sound || '',
+        mode: entry.mode || 'once',
+        intervalSeconds: typeof entry.intervalSeconds === 'number' ? entry.intervalSeconds : 30
+      });
+    });
+  });
+  return rows;
+}
+
+// The reverse, ready to POST. A row with no path or no sound chosen yet
+// (e.g. a just-added blank row) is skipped silently, not an error -- same
+// not-yet-used treatment the Zones tab already gives a blank zone row.
+function notifRowsToConfig(rows) {
+  const notifications = {};
+  rows.forEach((row) => {
+    const path = row.path.trim();
+    if (!path || !row.sound) return;
+    if (!notifications[path]) notifications[path] = {};
+    const entry = { sound: row.sound, mode: row.mode };
+    if (row.mode === 'repeat') {
+      entry.intervalSeconds = Number(row.intervalSeconds) || 30;
+    }
+    notifications[path][row.state] = entry;
+  });
+  return notifications;
+}
+
+// Same fetch-then-{ok,data} shape as persistToProfile/pushZonesToServer
+// above, so the Save handler below can reuse their exact
+// "!ok -> throw new Error(data.error)" idiom rather than inventing a
+// slightly different one for this tab.
+function postNotificationConfig(payload) {
+  return fetch('/plugins/signalk-alarms/notification-config', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  }).then((r) => r.json().then((data) => ({ ok: r.ok, data: data })));
+}
+
+function fetchSounds() {
+  return fetch('/plugins/signalk-alarms/sounds')
+    .then((r) => r.json())
+    .then((data) => data.sounds || []);
+}
+
+// Shared by each row's sound <select> and the single default-sound
+// <select> -- populated from GET /sounds (an actual directory listing),
+// never a hardcoded list, same reasoning CLAUDE.md already applies to the
+// Zones tab's sound picker. A currently-selected filename that's no longer
+// present on disk (e.g. deleted since it was configured) is kept as an
+// explicit extra option rather than silently reverting to blank, so a
+// missing file is visible instead of hidden.
+function populateSoundSelect(select, selected, emptyLabel) {
+  select.innerHTML = '';
+  const emptyOpt = document.createElement('option');
+  emptyOpt.value = '';
+  emptyOpt.textContent = emptyLabel;
+  select.appendChild(emptyOpt);
+  availableSounds.forEach((sound) => {
+    const opt = document.createElement('option');
+    opt.value = sound;
+    opt.textContent = sound;
+    if (sound === selected) opt.selected = true;
+    select.appendChild(opt);
+  });
+  if (selected && !availableSounds.includes(selected)) {
+    const opt = document.createElement('option');
+    opt.value = selected;
+    opt.textContent = selected + ' (missing from sounds directory)';
+    opt.selected = true;
+    select.appendChild(opt);
+  }
+}
+
+function renderDefaultSoundSelect() {
+  const select = document.getElementById('notif-default-sound');
+  populateSoundSelect(select, notifDefaultSound, '(none configured)');
+}
+
+function fillNotifSaveStatus(el) {
+  if (!notifSaveStatus) {
+    el.textContent = '';
+    el.className = 'commit-status';
+    return;
+  }
+  el.textContent = notifSaveStatus.message;
+  el.className = 'commit-status commit-status-' + notifSaveStatus.type;
+}
+
+function renderNotifRows() {
+  const container = document.getElementById('notif-rows');
+  container.innerHTML = '';
+
+  if (notifRows.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'placeholder';
+    empty.textContent = 'No path/state sound bindings yet — click "Add path/state binding" below.';
+    container.appendChild(empty);
+    return;
+  }
+
+  notifRows.forEach((row, idx) => {
+    const rowEl = document.createElement('div');
+    rowEl.className = 'notif-row';
+
+    const pathInput = document.createElement('input');
+    pathInput.type = 'text';
+    pathInput.className = 'notif-path-input';
+    pathInput.placeholder = 'notifications.* path (e.g. notifications.navigation.anchor)';
+    pathInput.value = row.path;
+    pathInput.addEventListener('input', () => {
+      notifRows[idx].path = pathInput.value;
+    });
+
+    const stateSelect = document.createElement('select');
+    // No normal/nominal here -- those never trigger sound (see index.js's
+    // handleNotificationState), so they're not a valid binding target.
+    NOTIF_STATES.forEach((s) => {
+      const opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s;
+      if (s === row.state) opt.selected = true;
+      stateSelect.appendChild(opt);
+    });
+    stateSelect.addEventListener('change', () => {
+      notifRows[idx].state = stateSelect.value;
+    });
+
+    const soundSelect = document.createElement('select');
+    soundSelect.className = 'notif-sound-select';
+    populateSoundSelect(soundSelect, row.sound, '(choose sound)');
+    soundSelect.addEventListener('change', () => {
+      notifRows[idx].sound = soundSelect.value;
+    });
+
+    const modeSelect = document.createElement('select');
+    NOTIF_MODES.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = m;
+      if (m === row.mode) opt.selected = true;
+      modeSelect.appendChild(opt);
+    });
+
+    const intervalInput = document.createElement('input');
+    intervalInput.type = 'number';
+    intervalInput.min = '1';
+    intervalInput.className = 'notif-interval-input';
+    intervalInput.placeholder = 'Interval (s)';
+    intervalInput.value = row.intervalSeconds;
+    intervalInput.style.display = row.mode === 'repeat' ? '' : 'none';
+    intervalInput.addEventListener('input', () => {
+      notifRows[idx].intervalSeconds = intervalInput.value;
+    });
+
+    modeSelect.addEventListener('change', () => {
+      notifRows[idx].mode = modeSelect.value;
+      intervalInput.style.display = modeSelect.value === 'repeat' ? '' : 'none';
+    });
+
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'remove-zone-btn';
+    removeBtn.textContent = 'Remove';
+    removeBtn.addEventListener('click', () => {
+      notifRows.splice(idx, 1);
+      renderNotifRows();
+    });
+
+    rowEl.appendChild(pathInput);
+    rowEl.appendChild(stateSelect);
+    rowEl.appendChild(soundSelect);
+    rowEl.appendChild(modeSelect);
+    rowEl.appendChild(intervalInput);
+    rowEl.appendChild(removeBtn);
+    container.appendChild(rowEl);
+  });
+}
+
+function loadNotificationsTab() {
+  Promise.all([fetch('/plugins/signalk-alarms/config').then((r) => r.json()), fetchSounds()])
+    .then(([config, sounds]) => {
+      // Same envelope shape as the Zones tab's GET /config read above --
+      // our data lives under .configuration, not at the top level.
+      const ourData = (config && config.configuration) || {};
+      notifRows = configToNotifRows(ourData.notifications);
+      notifDefaultSound = ourData.defaultSound || '';
+      availableSounds = sounds;
+      renderDefaultSoundSelect();
+      renderNotifRows();
+    })
+    .catch((err) => {
+      const container = document.getElementById('notif-rows');
+      container.innerHTML = '';
+      const errMsg = document.createElement('p');
+      errMsg.className = 'placeholder';
+      errMsg.textContent = 'Failed to load notification config: ' + err.message;
+      container.appendChild(errMsg);
+    });
+}
+
+document.getElementById('notif-add-row-btn').addEventListener('click', () => {
+  notifRows.push(emptyNotifRow());
+  renderNotifRows();
+});
+
+// Sounds are added by hand on disk while this page may already be open --
+// this re-fetches the listing without a full page reload.
+document.getElementById('notif-refresh-sounds-btn').addEventListener('click', () => {
+  fetchSounds().then((sounds) => {
+    availableSounds = sounds;
+    renderDefaultSoundSelect();
+    renderNotifRows();
+  });
+});
+
+document.getElementById('notif-default-sound').addEventListener('change', (e) => {
+  notifDefaultSound = e.target.value;
+});
+
+document.getElementById('notif-save-btn').addEventListener('click', () => {
+  const payload = {
+    notifications: notifRowsToConfig(notifRows),
+    defaultSound: notifDefaultSound || null
+  };
+  const statusEl = document.getElementById('notif-save-status');
+  notifSaveStatus = { type: 'pending', message: 'Saving...' };
+  fillNotifSaveStatus(statusEl);
+  postNotificationConfig(payload)
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Save failed');
+      // Re-sync from the server's own cleaned/validated copy (it may have
+      // dropped an empty state map, etc.) rather than trusting the payload
+      // we sent -- same reasoning Commit's success handler applies to
+      // defaultProfileZones above.
+      notifRows = configToNotifRows(data.notifications);
+      notifDefaultSound = data.defaultSound || '';
+      notifSaveStatus = { type: 'success', message: 'Saved.' };
+      fillNotifSaveStatus(statusEl);
+      renderNotifRows();
+    })
+    .catch((err) => {
+      notifSaveStatus = { type: 'error', message: err.message };
+      fillNotifSaveStatus(statusEl);
+    });
+});
+
+loadNotificationsTab();
