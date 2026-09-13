@@ -16,6 +16,156 @@ module.exports = function (app) {
     properties: {}
   };
 
+  // --- Profiles: shared shape/helpers -----------------------------------
+  // A profile now covers BOTH tabs -- { zones, notifications, defaultSound }
+  // -- and configuration.activeProfile names whichever one is currently
+  // staged/live. Replaces the old split where zones lived under
+  // profiles.Default (hardcoded) while notifications/defaultSound were
+  // flat, top-level, and not profile-scoped at all.
+
+  // Ensures configuration.profiles[name] exists and has the full expected
+  // shape, without clobbering whatever's already there -- used by every
+  // route that reads/writes a profile, not just at migration time, so a
+  // profile created before some future field existed still self-heals.
+  function ensureProfile(configuration, name) {
+    if (!configuration.profiles) configuration.profiles = {};
+    if (!configuration.profiles[name]) {
+      configuration.profiles[name] = { zones: {}, notifications: {}, defaultSound: null };
+    }
+    const profile = configuration.profiles[name];
+    if (!profile.zones) profile.zones = {};
+    if (!profile.notifications) profile.notifications = {};
+    if (profile.defaultSound === undefined) profile.defaultSound = null;
+    return profile;
+  }
+
+  function getActiveProfileName(configuration) {
+    return configuration.activeProfile || 'Default';
+  }
+
+  function getConfiguration() {
+    const options = app.readPluginOptions() || {};
+    return options.configuration || {};
+  }
+
+  // One-time (but idempotent -- safe to run on every startup) migration to
+  // the profiles-cover-everything data model. Confirmed via discovery
+  // before writing this: the old shape had zones under profiles.Default
+  // (hardcoded, but real) alongside a dead profiles.Default.sounds: {}
+  // stub, while notifications/defaultSound lived flat at the top level,
+  // not profile-scoped at all. Also fixes a real dead-config bug found
+  // during that same discovery: a notifications key missing its
+  // "notifications." prefix can never match a live delta (deltas always
+  // carry the full path) -- see the per-profile fix-up below.
+  function migrateConfig(data) {
+    let changed = false;
+
+    if (!data.pathSettings) {
+      data.pathSettings = {};
+      changed = true;
+    }
+
+    if (!data.profiles || Object.keys(data.profiles).length === 0) {
+      data.profiles = { Default: { zones: {}, notifications: {}, defaultSound: null } };
+      changed = true;
+    }
+
+    // Normalize every existing profile's shape -- defensive/self-healing
+    // in general, not just for the legacy single-profile case. Drops the
+    // dead `sounds` stub (never used by anything -- the real per-path
+    // sound bindings always lived in the Notifications tab's own
+    // `notifications` structure, never in a profile's `sounds` field).
+    Object.keys(data.profiles).forEach((name) => {
+      const profile = data.profiles[name];
+      if (!profile.zones) {
+        profile.zones = {};
+        changed = true;
+      }
+      if (!profile.notifications) {
+        profile.notifications = {};
+        changed = true;
+      }
+      if (profile.defaultSound === undefined) {
+        profile.defaultSound = null;
+        changed = true;
+      }
+      if (profile.sounds !== undefined) {
+        delete profile.sounds;
+        changed = true;
+      }
+    });
+
+    // Move legacy flat top-level notifications/defaultSound into
+    // profiles.Default specifically (not "whichever profile is active" --
+    // activeProfile doesn't even exist yet on a first-ever migration, and
+    // Default is where this data actually came from, since it was the
+    // only profile that ever existed under the old shape). Checked before
+    // moving, not clobbered: an existing profiles.Default.notifications
+    // entry for the same key wins over the legacy top-level one, logged
+    // rather than silently dropped.
+    if (data.notifications !== undefined) {
+      if (!data.profiles.Default) data.profiles.Default = { zones: {}, notifications: {}, defaultSound: null };
+      if (!data.profiles.Default.notifications) data.profiles.Default.notifications = {};
+      const target = data.profiles.Default.notifications;
+      Object.keys(data.notifications).forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(target, key)) {
+          console.warn(
+            'signalk-alarms: migration kept profiles.Default.notifications["' + key + '"] over the legacy top-level entry of the same key'
+          );
+        } else {
+          target[key] = data.notifications[key];
+        }
+      });
+      delete data.notifications;
+      changed = true;
+    }
+
+    if (data.defaultSound !== undefined) {
+      if (!data.profiles.Default) data.profiles.Default = { zones: {}, notifications: {}, defaultSound: null };
+      if (!data.profiles.Default.defaultSound) {
+        data.profiles.Default.defaultSound = data.defaultSound;
+      }
+      delete data.defaultSound;
+      changed = true;
+    }
+
+    if (!data.activeProfile) {
+      data.activeProfile = Object.keys(data.profiles)[0] || 'Default';
+      changed = true;
+    }
+
+    // Dead-entry fix, applied across every profile (not just Default) so
+    // this stays self-healing if the same class of bug ever recurs, not
+    // just a one-off cleanup of today's known instance. If the correctly-
+    // prefixed key already exists, the dead unprefixed one is dropped
+    // (logged), not silently merged into it.
+    Object.keys(data.profiles).forEach((name) => {
+      const notifications = data.profiles[name].notifications || {};
+      Object.keys(notifications).forEach((key) => {
+        if (key && !key.startsWith('notifications.')) {
+          const fixedKey = 'notifications.' + key;
+          if (Object.prototype.hasOwnProperty.call(notifications, fixedKey)) {
+            console.warn(
+              'signalk-alarms: migration dropped dead unprefixed notifications key "' +
+                key +
+                '" in profile "' +
+                name +
+                '" -- "' +
+                fixedKey +
+                '" already exists there'
+            );
+          } else {
+            notifications[fixedKey] = notifications[key];
+          }
+          delete notifications[key];
+          changed = true;
+        }
+      });
+    });
+
+    return changed;
+  }
+
   // --- Notifications tab: sound playback state -------------------------
   // Module-scope (shared by plugin.start/stop and the router below), not
   // function-local -- plugin.start/stop can each run more than once against
@@ -134,12 +284,17 @@ module.exports = function (app) {
     }
   }
 
+  // Reads the CURRENTLY ACTIVE profile's notifications/defaultSound, fresh
+  // on every call (no caching) -- so switching the active profile takes
+  // effect on the very next notification delta, with no restart needed,
+  // same as notifications config changes already did before profiles
+  // existed.
   function getNotificationsConfig() {
-    const options = app.readPluginOptions() || {};
-    const configuration = options.configuration || {};
+    const configuration = getConfiguration();
+    const profile = configuration.profiles && configuration.profiles[getActiveProfileName(configuration)];
     return {
-      notifications: configuration.notifications || {},
-      defaultSound: configuration.defaultSound || null
+      notifications: (profile && profile.notifications) || {},
+      defaultSound: (profile && profile.defaultSound) || null
     };
   }
 
@@ -213,38 +368,10 @@ module.exports = function (app) {
     // deeper every restart. Confirmed against signalk-server's own source
     // (appCopy.savePluginOptions in src/interfaces/plugins.ts).
     const data = options || {};
-    let changed = false;
 
-    if (!data.pathSettings) {
-      data.pathSettings = {};
-      changed = true;
-    }
-
-    if (!data.profiles || Object.keys(data.profiles).length === 0) {
-      data.profiles = { Default: { zones: {}, sounds: {} } };
-      changed = true;
-    }
-
-    // Notifications tab config: plugin-owned JSON, top-level (not nested
-    // under a profile) per this session's explicit design -- a path's sound
-    // bindings apply the same way regardless of which zones profile is
-    // active. `data.defaultSound === undefined` (not falsy) is the seed
-    // check, since '' or null are both legitimate "not configured yet"
-    // values once the user has actually saved the Notifications tab once
-    // (e.g. cleared it back out) -- only truly absent (never saved) should
-    // be seeded.
-    if (!data.notifications) {
-      data.notifications = {};
-      changed = true;
-    }
-    if (data.defaultSound === undefined) {
-      data.defaultSound = null;
-      changed = true;
-    }
-
-    if (changed) {
+    if (migrateConfig(data)) {
       app.savePluginOptions(data, () => {
-        app.debug('signalk-alarms: initialized pathSettings/profiles/notifications store');
+        app.debug('signalk-alarms: migrated config to profiles-cover-everything shape');
       });
     }
 
@@ -302,22 +429,22 @@ module.exports = function (app) {
     const validStates = ['nominal', 'alert', 'warn', 'alarm', 'emergency'];
 
     // Shared by /commit-zone's persist step and /persist-zone -- the one
-    // place that writes profiles.Default.zones[path] in the persisted
-    // plugin config. An empty zones array is a legitimate "no alarm on
-    // this path" end state, not an error: it deletes the path's entry
-    // entirely rather than leaving a stale empty array behind, so GET
-    // /config's stored profile genuinely shows no trace of a path that's
-    // been fully cleared.
+    // place that writes the ACTIVE profile's zones[path] in the persisted
+    // plugin config. Reads activeProfile fresh each call (via
+    // getConfiguration/ensureProfile) rather than hardcoding "Default", so
+    // whichever profile is currently staged is the one that gets edited --
+    // this is the core of what makes more than one profile actually work.
+    // An empty zones array is a legitimate "no alarm on this path" end
+    // state, not an error: it deletes the path's entry entirely rather than
+    // leaving a stale empty array behind, so GET /profiles/:name genuinely
+    // shows no trace of a path that's been fully cleared.
     function persistZonesForPath(path, zones, cb) {
-      const options = app.readPluginOptions() || {};
-      const configuration = options.configuration || {};
-      if (!configuration.profiles) configuration.profiles = {};
-      if (!configuration.profiles.Default) configuration.profiles.Default = { zones: {}, sounds: {} };
-      if (!configuration.profiles.Default.zones) configuration.profiles.Default.zones = {};
+      const configuration = getConfiguration();
+      const profile = ensureProfile(configuration, getActiveProfileName(configuration));
       if (zones.length === 0) {
-        delete configuration.profiles.Default.zones[path];
+        delete profile.zones[path];
       } else {
-        configuration.profiles.Default.zones[path] = zones;
+        profile.zones[path] = zones;
       }
       app.savePluginOptions(configuration, cb);
     }
@@ -479,7 +606,7 @@ module.exports = function (app) {
     // Get Live's persistence step (see CLAUDE.md "Stored state vs. live:
     // sync philosophy" and the revised "Get live" decision under "Tab 1 —
     // Zones"): writes a zones array (read by the caller from GET
-    // /live-meta) straight into the stored profile via the same
+    // /live-meta) straight into the active profile via the same
     // persistZonesForPath() helper /commit-zone uses -- deliberately does
     // NOT touch meta or call app.handleMessage at all. Get Live reads live,
     // writes stored + draft, nothing else; Commit remains the only thing
@@ -596,20 +723,23 @@ module.exports = function (app) {
     const validNotificationStates = ['alert', 'warn', 'alarm', 'emergency'];
     const validPlaybackModes = ['once', 'repeat'];
 
-    // Saves the whole Notifications tab config in one shot -- notifications
-    // (path -> state -> {sound, mode, intervalSeconds}) and defaultSound.
-    // Unlike the Zones tab's zones (which reconcile against a live "Server"
-    // copy via Get Live/Commit/Refresh/Send-to-server), this is plugin-owned
+    // Saves the ACTIVE profile's Notifications tab config in one shot --
+    // notifications (path -> state -> {sound, mode, intervalSeconds}) and
+    // defaultSound, both now living under profiles[activeProfile] rather
+    // than flat top-level keys (see the profiles migration above). Unlike
+    // the Zones tab's zones (which reconcile against a live "Server" copy
+    // via Get Live/Commit/Refresh/Send-to-server), this is plugin-owned
     // config with nothing else to reconcile against, so there's no per-path
     // merge step here the way persistZonesForPath has for zones -- the
-    // submitted notifications object simply replaces the stored one
-    // wholesale, same as any plain settings form. Deliberately does NOT
-    // reuse the server's generic POST /plugins/<id>/config (which restarts
-    // the plugin on every save, per CLAUDE.md's gotcha about that route) --
-    // a restart on every Notifications-tab save would tear down the live
-    // notification subscription and any in-progress repeat timers/queued
-    // sounds for no reason, since app.savePluginOptions() (used here, same
-    // as every other route in this file) already persists without one.
+    // submitted notifications object simply replaces the active profile's
+    // stored one wholesale, same as any plain settings form. Deliberately
+    // does NOT reuse the server's generic POST /plugins/<id>/config (which
+    // restarts the plugin on every save, per CLAUDE.md's gotcha about that
+    // route) -- a restart on every Notifications-tab save would tear down
+    // the live notification subscription and any in-progress repeat
+    // timers/queued sounds for no reason, since app.savePluginOptions()
+    // (used here, same as every other route in this file) already persists
+    // without one.
     router.post('/notification-config', (req, res) => {
       const body = req.body || {};
       const notifications = body.notifications;
@@ -618,6 +748,20 @@ module.exports = function (app) {
       if (!notifications || typeof notifications !== 'object' || Array.isArray(notifications)) {
         res.status(400).json({ error: 'notifications must be an object' });
         return;
+      }
+
+      // Defense in depth against the exact dead-config bug the migration
+      // above fixes retroactively: a notifications key not starting with
+      // "notifications." can never match a real delta (deltas always carry
+      // the full path), so reject it here rather than silently saving
+      // something that will never fire. The frontend's own path input now
+      // auto-prefixes before this is ever called, but this route doesn't
+      // trust that alone.
+      for (const notifPath of Object.keys(notifications)) {
+        if (notifPath && !notifPath.startsWith('notifications.')) {
+          res.status(400).json({ error: 'path "' + notifPath + '" must start with "notifications."' });
+          return;
+        }
       }
 
       let availableSounds;
@@ -698,10 +842,10 @@ module.exports = function (app) {
         }
       }
 
-      const options = app.readPluginOptions() || {};
-      const configuration = options.configuration || {};
-      configuration.notifications = cleanNotifications;
-      configuration.defaultSound = defaultSound || null;
+      const configuration = getConfiguration();
+      const profile = ensureProfile(configuration, getActiveProfileName(configuration));
+      profile.notifications = cleanNotifications;
+      profile.defaultSound = defaultSound || null;
 
       app.savePluginOptions(configuration, (err) => {
         if (err) {
@@ -709,7 +853,155 @@ module.exports = function (app) {
           res.status(500).json({ error: 'failed to save notification config: ' + err.message });
           return;
         }
-        res.json({ ok: true, notifications: cleanNotifications, defaultSound: configuration.defaultSound });
+        res.json({ ok: true, notifications: cleanNotifications, defaultSound: profile.defaultSound });
+      });
+    });
+
+    // --- Profiles: list/read/save/switch ---------------------------------
+
+    // Names + which one's active, for populating the profile-bar dropdown --
+    // not full content (GET /profiles/:name below is for that), since the
+    // dropdown only ever needs to know what's available to switch to.
+    router.get('/profiles', (req, res) => {
+      const configuration = getConfiguration();
+      const names = Object.keys(configuration.profiles || {});
+      res.json({ activeProfile: getActiveProfileName(configuration), names: names });
+    });
+
+    router.get('/profiles/:name', (req, res) => {
+      const configuration = getConfiguration();
+      const profile = configuration.profiles && configuration.profiles[req.params.name];
+      if (!profile) {
+        res.status(404).json({ error: 'no profile named "' + req.params.name + '"' });
+        return;
+      }
+      res.json({
+        zones: profile.zones || {},
+        notifications: profile.notifications || {},
+        defaultSound: profile.defaultSound || null
+      });
+    });
+
+    // Save (create or overwrite) a profile wholesale with the posted
+    // { zones, notifications, defaultSound } -- used for both Save (posts
+    // to the current activeProfile's name) and Save As (posts to a new
+    // name; the frontend separately calls POST /active-profile after this
+    // succeeds). Only structural validation here (object shapes, the same
+    // notifications-path-prefix guard /notification-config enforces) --
+    // deliberately not re-running the full per-zone state/bound or per-
+    // sound file-exists checks, since this data already passed through
+    // /commit-zone's or /persist-zone's and /notification-config's own
+    // validation on the way to becoming "currently staged" in the first
+    // place; this route's job is copying that staged state into a named
+    // slot, not re-validating it from scratch.
+    router.post('/profiles/:name', (req, res) => {
+      const name = req.params.name;
+      if (!name) {
+        res.status(400).json({ error: 'profile name is required' });
+        return;
+      }
+      const body = req.body || {};
+      const zones = body.zones;
+      const notifications = body.notifications;
+      const defaultSound = body.defaultSound;
+
+      if (zones !== undefined && (typeof zones !== 'object' || zones === null || Array.isArray(zones))) {
+        res.status(400).json({ error: 'zones must be an object' });
+        return;
+      }
+      if (
+        notifications !== undefined &&
+        (typeof notifications !== 'object' || notifications === null || Array.isArray(notifications))
+      ) {
+        res.status(400).json({ error: 'notifications must be an object' });
+        return;
+      }
+      for (const notifPath of Object.keys(notifications || {})) {
+        if (notifPath && !notifPath.startsWith('notifications.')) {
+          res.status(400).json({ error: 'notifications path "' + notifPath + '" must start with "notifications."' });
+          return;
+        }
+      }
+
+      const configuration = getConfiguration();
+      if (!configuration.profiles) configuration.profiles = {};
+      configuration.profiles[name] = {
+        zones: zones || {},
+        notifications: notifications || {},
+        defaultSound: defaultSound || null
+      };
+
+      app.savePluginOptions(configuration, (err) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'failed to save profile: ' + err.message });
+          return;
+        }
+        res.json({ ok: true, name: name });
+      });
+    });
+
+    // Switches which profile is "active" -- called whenever a profile is
+    // loaded/switched in the profile bar. Does NOT touch SignalK or change
+    // any staged zones/notifications itself; the frontend is responsible
+    // for updating its own staged state (Replace/Merge) separately, this
+    // route only flips the pointer so persistZonesForPath/getNotificationsConfig
+    // (and every other activeProfile-aware read/write) start operating on
+    // the new profile from this point on.
+    router.post('/active-profile', (req, res) => {
+      const body = req.body || {};
+      const name = body.name;
+      if (!name || typeof name !== 'string') {
+        res.status(400).json({ error: 'name is required' });
+        return;
+      }
+      const configuration = getConfiguration();
+      if (!configuration.profiles || !configuration.profiles[name]) {
+        res.status(400).json({ error: 'no profile named "' + name + '"' });
+        return;
+      }
+      configuration.activeProfile = name;
+      app.savePluginOptions(configuration, (err) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'failed to set active profile: ' + err.message });
+          return;
+        }
+        res.json({ ok: true, activeProfile: name });
+      });
+    });
+
+    // Rejects two cases, both returned as a real error the frontend can
+    // show rather than a silent no-op: deleting the currently-active
+    // profile (the user must switch to a different one first -- there
+    // must always be an unambiguous "what am I editing right now"), and
+    // deleting the last remaining profile (there must always be at least
+    // one to be active). Otherwise removes it from configuration.profiles
+    // and saves via the same app.savePluginOptions pattern as every other
+    // route here.
+    router.delete('/profiles/:name', (req, res) => {
+      const name = req.params.name;
+      const configuration = getConfiguration();
+      if (!configuration.profiles || !configuration.profiles[name]) {
+        res.status(404).json({ error: 'no profile named "' + name + '"' });
+        return;
+      }
+      if (getActiveProfileName(configuration) === name) {
+        res.status(400).json({ error: 'cannot delete "' + name + '" -- it is the active profile. Switch to a different profile first.' });
+        return;
+      }
+      if (Object.keys(configuration.profiles).length <= 1) {
+        res.status(400).json({ error: 'cannot delete the last remaining profile' });
+        return;
+      }
+      delete configuration.profiles[name];
+      app.savePluginOptions(configuration, (err) => {
+        if (err) {
+          console.error(err);
+          res.status(500).json({ error: 'failed to delete profile: ' + err.message });
+          return;
+        }
+        res.json({ ok: true, name: name });
       });
     });
   };

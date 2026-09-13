@@ -16,7 +16,7 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
 // Profile") -- the old draft layer (unsaved, in-browser-only edits, lost on
 // navigation) is retired entirely:
 //   Server  -- live meta.zones, evaluated by SignalK core.
-//   Profile -- profiles.Default.zones, our own persisted config.
+//   Profile -- profiles[activeProfile].zones, our own persisted config.
 // Editing a row auto-saves into Profile (debounced); there's nothing else
 // to lose by navigating away. "editableZones" below is the on-screen
 // editable view of Profile for whichever row is expanded, not a separate
@@ -30,9 +30,36 @@ const ZONE_STATE_CLASS = {
   emergency: 'zone-state-emergency'
 };
 
+// Sort key for "boundary value, small to large" (buildZoneBar below) -- a
+// zone with no defined lower bound is conceptually the smallest (unbounded
+// downward), so it sorts first.
+function zoneSortValue(zone) {
+  return typeof zone.lower === 'number' ? zone.lower : -Infinity;
+}
+
+// Same idea for the editable zone list (editableZones' rows are the
+// string-shaped input values, not the numeric zones shape zoneSortValue
+// above expects) -- a blank or non-numeric lower field sorts first, same
+// "unbounded downward = smallest" treatment.
+function editableZoneSortValue(row) {
+  const trimmed = (row.lower || '').toString().trim();
+  if (trimmed === '') return -Infinity;
+  const num = Number(trimmed);
+  return isNaN(num) ? -Infinity : num;
+}
+
 let allPaths = [];
 let defaultProfileZones = {};
 let expandedPath = null;
+
+// Which profile is currently staged/active, and the full list of saved
+// profile names (for the profile-bar dropdown) -- see the "Profile bar"
+// section near the end of this file. Set from GET /config's own
+// activeProfile/profiles keys at each tab's load time (both Zones' and
+// Notifications' load functions set these identically, since both already
+// fetch the same /config envelope -- harmless redundancy, not a race).
+let activeProfile = 'Default';
+let profileNames = ['Default'];
 
 // path -> units string (or null), bulk-loaded once at tab load (GET /units)
 // same as defaultProfileZones -- display-only, feeds formatWithUnit() for
@@ -185,7 +212,14 @@ function formatWithUnit(rawValue, units) {
 // going through formatWithUnit at all.
 function formatLiveValue(value, units) {
   if (typeof value === 'number') {
-    return formatWithUnit(value, units);
+    // Rounded here only -- a live streaming value can carry many decimal
+    // digits of floating-point noise (e.g. 0.9260002345867262), which
+    // formatWithUnit's own bare `${rawValue}` would print in full. Boundary
+    // labels and the live-typing hints call formatWithUnit directly and
+    // must keep showing exactly what's typed/stored, unrounded -- this
+    // rounding is deliberately local to the live-value readout, not pushed
+    // into formatWithUnit itself.
+    return formatWithUnit(Number(value.toFixed(2)), units);
   }
   return JSON.stringify(value);
 }
@@ -427,6 +461,73 @@ function fetchLiveZonesBulk() {
   return fetch('/plugins/signalk-alarms/live-zones').then((r) => r.json());
 }
 
+// --- Unsaved-changes guard (Send to server vs. saved profiles) ---------
+//
+// Whole-object versions of zonesEqual above, plus an analogous comparison
+// for notifications -- used only by the "does currently-staged state match
+// ANY saved profile" check before Send to server, not by Refresh/mismatch
+// (which stays exactly as it was: Profile zones vs. live Server zones,
+// one path at a time).
+
+function zonesObjectsEqual(a, b) {
+  const paths = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  for (const p of paths) {
+    if (!zonesEqual((a || {})[p], (b || {})[p])) return false;
+  }
+  return true;
+}
+
+function notificationEntryKey(entry) {
+  if (!entry) return '';
+  return [entry.sound || '', entry.mode || '', typeof entry.intervalSeconds === 'number' ? entry.intervalSeconds : ''].join('|');
+}
+
+function notificationsEqual(a, b) {
+  const paths = new Set([...Object.keys(a || {}), ...Object.keys(b || {})]);
+  for (const p of paths) {
+    const aStates = (a || {})[p] || {};
+    const bStates = (b || {})[p] || {};
+    const states = new Set([...Object.keys(aStates), ...Object.keys(bStates)]);
+    for (const s of states) {
+      if (notificationEntryKey(aStates[s]) !== notificationEntryKey(bStates[s])) return false;
+    }
+  }
+  return true;
+}
+
+// The currently-staged {zones, notifications, defaultSound} -- same shape
+// GET/POST /profiles/:name use, built from the exact same in-memory state
+// Save/Save As already send. Shared by the profile bar (below) and this
+// guard, so there's one definition of "what's staged right now".
+function currentStagedProfileContent() {
+  return {
+    zones: defaultProfileZones,
+    notifications: notifRowsToConfig(notifRows),
+    defaultSound: notifDefaultSound || null
+  };
+}
+
+function profileContentMatches(staged, profile) {
+  return (
+    zonesObjectsEqual(staged.zones, profile.zones) &&
+    notificationsEqual(staged.notifications, profile.notifications) &&
+    (staged.defaultSound || null) === (profile.defaultSound || null)
+  );
+}
+
+// Fetches every saved profile's full content (GET /profiles/:name, one per
+// name -- no separate bulk-content route exists per spec, and profile
+// counts are small enough that N small requests is fine) and checks
+// whether the currently-staged state deep-equals ANY of them, not just the
+// active one -- a Merge can produce a combination that matches neither
+// source profile it was merged from.
+function stagedMatchesAnyProfile() {
+  const staged = currentStagedProfileContent();
+  return Promise.all(profileNames.map((name) => fetch('/plugins/signalk-alarms/profiles/' + encodeURIComponent(name)).then((r) => r.json()))).then(
+    (profiles) => profiles.some((profile) => profileContentMatches(staged, profile))
+  );
+}
+
 // Compares every known path's Profile zones against its live zones (a
 // path absent from either side is treated as []) and returns the Set of
 // paths that differ. Only iterates allPaths -- a path Refresh doesn't show
@@ -485,6 +586,32 @@ function updateSyncStatusBadges(path) {
   document.querySelectorAll('.sync-status-badge[data-sync-path="' + path + '"]').forEach((el) => {
     fillSyncStatusBadge(el, path);
   });
+}
+
+// The pre-existing Send-to-server flow (re-check live zones, count
+// mismatches, ask for confirmation) -- unchanged in what it does, just
+// extracted so the new unsaved-changes guard (below) can run first and
+// fall through into this exact same flow afterward, whether the user
+// picked "Send without saving" or "Save and send" (after the save
+// actually completes).
+function proceedToMismatchCheck() {
+  sendStatus = { type: 'checking' };
+  renderGlobalActions();
+  fetchLiveZonesBulk()
+    .then((liveZonesByPath) => {
+      const mismatches = computeMismatches(liveZonesByPath);
+      const paths = Array.from(mismatches);
+      if (paths.length === 0) {
+        sendStatus = { type: 'none', message: 'No changes to send.' };
+      } else {
+        sendStatus = { type: 'confirm', count: paths.length, paths: paths };
+      }
+      renderGlobalActions();
+    })
+    .catch((err) => {
+      sendStatus = { type: 'error', message: 'Failed to check for changes: ' + err.message };
+      renderGlobalActions();
+    });
 }
 
 function renderGlobalActions() {
@@ -565,48 +692,109 @@ function renderGlobalActions() {
     container.appendChild(confirmText);
     container.appendChild(confirmBtn);
     container.appendChild(cancelBtn);
+  } else if (sendStatus && sendStatus.type === 'unsaved-confirm') {
+    // Reached only when the currently-staged state matches NO saved
+    // profile (checked fresh by sendBtn's click handler below, via
+    // stagedMatchesAnyProfile) -- three real choices, not a plain OK/
+    // Cancel, per the explicit requirement.
+    const text = document.createElement('span');
+    text.className = 'send-confirm-text';
+    text.textContent = "This configuration doesn't match any saved profile. Save it before sending to server?";
+
+    const saveAndSendBtn = document.createElement('button');
+    saveAndSendBtn.type = 'button';
+    saveAndSendBtn.className = 'send-confirm-btn';
+    saveAndSendBtn.textContent = 'Save and send';
+    saveAndSendBtn.addEventListener('click', () => {
+      sendStatus = { type: 'checking' };
+      renderGlobalActions();
+      saveProfileContent(activeProfile, currentStagedProfileContent())
+        .then(({ ok, data }) => {
+          if (!ok) throw new Error(data.error || 'Save failed');
+          proceedToMismatchCheck();
+        })
+        .catch((err) => {
+          sendStatus = { type: 'error', message: 'Save failed: ' + err.message };
+          renderGlobalActions();
+        });
+    });
+
+    const sendWithoutSavingBtn = document.createElement('button');
+    sendWithoutSavingBtn.type = 'button';
+    sendWithoutSavingBtn.className = 'send-confirm-btn';
+    sendWithoutSavingBtn.textContent = 'Send without saving';
+    sendWithoutSavingBtn.addEventListener('click', () => {
+      proceedToMismatchCheck();
+    });
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'send-cancel-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+      sendStatus = null;
+      renderGlobalActions();
+    });
+
+    container.appendChild(text);
+    container.appendChild(saveAndSendBtn);
+    container.appendChild(sendWithoutSavingBtn);
+    container.appendChild(cancelBtn);
   } else {
     const sendBtn = document.createElement('button');
     sendBtn.type = 'button';
     sendBtn.className = 'send-btn';
-    sendBtn.disabled = !!(sendStatus && (sendStatus.type === 'checking' || sendStatus.type === 'sending'));
+    sendBtn.disabled = !!(
+      sendStatus &&
+      (sendStatus.type === 'checking' || sendStatus.type === 'sending' || sendStatus.type === 'unsaved-check')
+    );
     sendBtn.textContent =
       sendStatus && sendStatus.type === 'sending'
         ? 'Sending...'
-        : sendStatus && sendStatus.type === 'checking'
+        : sendStatus && (sendStatus.type === 'checking' || sendStatus.type === 'unsaved-check')
           ? 'Checking...'
           : 'Send to server';
     sendBtn.title = 'Push every path where Profile differs from the server. Re-checks fresh when clicked, then asks for confirmation.';
     sendBtn.addEventListener('click', () => {
-      sendStatus = { type: 'checking' };
+      // Unsaved-changes guard, checked BEFORE the pre-existing mismatch-
+      // count flow: does the currently-staged state match any saved
+      // profile at all? If it matches none, ask before proceeding; if it
+      // matches one (the common case -- nothing's been edited since the
+      // last Save), skip straight to the existing flow, unchanged.
+      sendStatus = { type: 'unsaved-check' };
       renderGlobalActions();
-      fetchLiveZonesBulk()
-        .then((liveZonesByPath) => {
-          const mismatches = computeMismatches(liveZonesByPath);
-          const paths = Array.from(mismatches);
-          if (paths.length === 0) {
-            sendStatus = { type: 'none', message: 'No changes to send.' };
+      stagedMatchesAnyProfile()
+        .then((matches) => {
+          if (matches) {
+            proceedToMismatchCheck();
           } else {
-            sendStatus = { type: 'confirm', count: paths.length, paths: paths };
+            sendStatus = { type: 'unsaved-confirm' };
+            renderGlobalActions();
           }
-          renderGlobalActions();
         })
         .catch((err) => {
-          sendStatus = { type: 'error', message: 'Failed to check for changes: ' + err.message };
+          sendStatus = { type: 'error', message: 'Failed to check saved profiles: ' + err.message };
           renderGlobalActions();
         });
     });
     container.appendChild(sendBtn);
   }
 
-  if (refreshStatus && !(sendStatus && sendStatus.type === 'confirm')) {
+  if (refreshStatus && !(sendStatus && (sendStatus.type === 'confirm' || sendStatus.type === 'unsaved-confirm'))) {
     const refreshStatusEl = document.createElement('span');
     refreshStatusEl.className = 'refresh-status refresh-status-' + refreshStatus.type;
     refreshStatusEl.textContent = refreshStatus.message;
     container.appendChild(refreshStatusEl);
   }
 
-  if (sendStatus && sendStatus.type !== 'confirm' && sendStatus.type !== 'checking' && sendStatus.type !== 'sending') {
+  if (
+    sendStatus &&
+    sendStatus.type !== 'confirm' &&
+    sendStatus.type !== 'checking' &&
+    sendStatus.type !== 'sending' &&
+    sendStatus.type !== 'unsaved-check' &&
+    sendStatus.type !== 'unsaved-confirm'
+  ) {
     const sendStatusEl = document.createElement('span');
     sendStatusEl.className = 'send-status send-status-' + sendStatus.type;
     sendStatusEl.textContent = sendStatus.message;
@@ -677,7 +865,16 @@ function buildZoneBar(zones, sizeClass, emptyMessage, units, currentValue) {
   const labelsRow = sizeClass === 'full' ? document.createElement('div') : null;
   if (labelsRow) labelsRow.className = 'zone-bar-labels';
 
-  zones.forEach((zone) => {
+  // Display order only (segments are absolutely positioned by their own
+  // lower/upper regardless of iteration order, so this doesn't change the
+  // bar's visual layout) -- but it does put the boundary labelsRow's DOM
+  // order in left-to-right sync with the bar above it, and is what the
+  // task actually asked for: "the displayed order always matches the
+  // physical bar's left-to-right layout". A sorted copy, not an in-place
+  // sort -- `zones` here is defaultProfileZones[path] itself, not a copy.
+  const sortedZones = zones.slice().sort((a, b) => zoneSortValue(a) - zoneSortValue(b));
+
+  sortedZones.forEach((zone) => {
     const zLower = typeof zone.lower === 'number' ? zone.lower : lowest;
     const zUpper = typeof zone.upper === 'number' ? zone.upper : highest;
     const seg = document.createElement('div');
@@ -717,7 +914,11 @@ function buildZoneBar(zones, sizeClass, emptyMessage, units, currentValue) {
     const marker = document.createElement('div');
     marker.className = 'zone-bar-value-marker';
     marker.style.left = ((currentValue - lowest) / span) * 100 + '%';
-    marker.title = 'Current value: ' + formatWithUnit(currentValue, units);
+    // Rounded the same way formatLiveValue rounds the Current Value text
+    // (currentValue is a live streaming reading, same floating-point-noise
+    // concern) -- boundary labels/typing hints call formatWithUnit directly
+    // and stay unrounded, this is only the marker's own tooltip.
+    marker.title = 'Current value: ' + formatWithUnit(Number(currentValue.toFixed(2)), units);
     bar.appendChild(marker);
   }
 
@@ -933,7 +1134,18 @@ function renderZonesList() {
       const editListEl = document.createElement('div');
       editListEl.className = 'draft-zones-list';
 
-      editableZones.forEach((zone, idx) => {
+      // Sorted for display only, same {row, originalIndex}-pair technique
+      // as the Notifications tab's rows above -- every input below mutates
+      // editableZones[idx] directly, so preserving the original index (not
+      // just sorting the rows themselves) is what keeps those mutations
+      // hitting the right entry regardless of on-screen order. The
+      // underlying editableZones array order is never changed by this.
+      const sortedEditableZones = editableZones
+        .map((zone, originalIndex) => ({ zone: zone, originalIndex: originalIndex }))
+        .sort((a, b) => editableZoneSortValue(a.zone) - editableZoneSortValue(b.zone));
+
+      sortedEditableZones.forEach(({ zone, originalIndex }) => {
+        const idx = originalIndex;
         const zoneRow = document.createElement('div');
         zoneRow.className = 'commit-inputs';
 
@@ -1190,13 +1402,21 @@ function loadZonesTab() {
       // signalk-server's own source (getPluginOptions/appCopy.savePluginOptions
       // in src/interfaces/plugins.ts).
       const ourData = (config && config.configuration) || {};
+      // activeProfile/profileNames come from this same envelope rather than
+      // a separate GET /profiles call -- configuration.profiles' own keys
+      // are the profile names, and configuration.activeProfile is right
+      // there already, so a second request would just be redundant. GET
+      // /profiles (index.js) still exists per spec, just isn't needed here.
+      activeProfile = ourData.activeProfile || 'Default';
+      profileNames = Object.keys(ourData.profiles || {});
       defaultProfileZones =
-        (ourData.profiles && ourData.profiles.Default && ourData.profiles.Default.zones) || {};
+        (ourData.profiles && ourData.profiles[activeProfile] && ourData.profiles[activeProfile].zones) || {};
       pathUnits = units || {};
 
       populateSourceFilter(allPaths);
       renderGlobalActions();
       renderZonesList();
+      renderProfileBar();
     })
     .catch((err) => {
       const list = document.getElementById('zones-list');
@@ -1216,8 +1436,9 @@ loadZonesTab();
 // --- Notifications tab ---
 //
 // Plugin-owned config only (path -> state -> {sound, mode, intervalSeconds},
-// plus a single top-level defaultSound) -- NOT SignalK path metadata, so
-// unlike the Zones tab there's no Server/Profile split, no Get Live/Commit/
+// plus a single defaultSound), now living under profiles[activeProfile]
+// rather than flat top-level keys -- NOT SignalK path metadata, so unlike
+// the Zones tab there's no Server/Profile split, no Get Live/Commit/
 // Refresh/Send-to-server: just one editable list and one Save button, same
 // as any plain settings form. See index.js's /notification-config route for
 // why this posts there rather than the generic POST /plugins/<id>/config.
@@ -1229,6 +1450,18 @@ let notifSaveStatus = null; // {type: 'pending'|'success'|'error', message}
 
 const NOTIF_STATES = ['alert', 'warn', 'alarm', 'emergency'];
 const NOTIF_MODES = ['once', 'repeat'];
+
+// Display order only -- render-time sort, never reorders the underlying
+// notifRows array (see renderNotifRows below), so this has no effect on
+// what gets POSTed or how it's stored. Path alphabetically first; within
+// the same path, severity order (reusing NOTIF_STATES' own ordering above)
+// reads more sensibly than alphabetical would for states specifically --
+// "alert, warn, alarm, emergency" is a meaningful escalation, whereas
+// alphabetical ("alarm, alert, emergency, warn") isn't.
+function notifStateSortOrder(state) {
+  const i = NOTIF_STATES.indexOf(state);
+  return i === -1 ? NOTIF_STATES.length : i;
+}
 
 function emptyNotifRow() {
   return { path: '', state: 'alert', sound: '', mode: 'once', intervalSeconds: 30 };
@@ -1261,8 +1494,17 @@ function configToNotifRows(notifications) {
 function notifRowsToConfig(rows) {
   const notifications = {};
   rows.forEach((row) => {
-    const path = row.path.trim();
+    let path = row.path.trim();
     if (!path || !row.sound) return;
+    // Belt-and-suspenders alongside the path input's own blur handler
+    // (below): a real notification delta's path always carries the full
+    // "notifications.*" prefix, so a bare path here could never match one
+    // and would be silent dead configuration -- exactly the bug found
+    // during discovery (a "propulsion.head.temperature" entry that could
+    // never fire). Fixed here too so this can't recur even if a row is
+    // saved without ever blurring its path input (e.g. Save clicked
+    // immediately after typing).
+    if (!path.startsWith('notifications.')) path = 'notifications.' + path;
     if (!notifications[path]) notifications[path] = {};
     const entry = { sound: row.sound, mode: row.mode };
     if (row.mode === 'repeat') {
@@ -1347,7 +1589,20 @@ function renderNotifRows() {
     return;
   }
 
-  notifRows.forEach((row, idx) => {
+  // Sorted for display only -- a {row, originalIndex} pair per entry, not
+  // a sorted copy of the rows themselves, so every input's mutation below
+  // (which indexes into notifRows[idx]) still hits the correct underlying
+  // entry regardless of where it landed on screen. The stored array order
+  // itself is never touched.
+  const sortedRows = notifRows
+    .map((row, originalIndex) => ({ row: row, originalIndex: originalIndex }))
+    .sort((a, b) => {
+      if (a.row.path !== b.row.path) return a.row.path < b.row.path ? -1 : 1;
+      return notifStateSortOrder(a.row.state) - notifStateSortOrder(b.row.state);
+    });
+
+  sortedRows.forEach(({ row, originalIndex }) => {
+    const idx = originalIndex;
     const rowEl = document.createElement('div');
     rowEl.className = 'notif-row';
 
@@ -1358,6 +1613,21 @@ function renderNotifRows() {
     pathInput.value = row.path;
     pathInput.addEventListener('input', () => {
       notifRows[idx].path = pathInput.value;
+    });
+    // Auto-prefix on blur, not on every keystroke -- fixing it up mid-type
+    // would fight anyone actively typing the correct "notifications."
+    // prefix themselves (each keystroke would re-trigger the check against
+    // a still-partial string). Root-cause fix for the exact dead-config bug
+    // found during discovery: a real notification delta's path always
+    // carries the full prefix, so a bare path typed here could never match
+    // one and would silently do nothing at alarm time.
+    pathInput.addEventListener('blur', () => {
+      const trimmed = pathInput.value.trim();
+      if (trimmed && !trimmed.startsWith('notifications.')) {
+        const fixed = 'notifications.' + trimmed;
+        pathInput.value = fixed;
+        notifRows[idx].path = fixed;
+      }
     });
 
     const stateSelect = document.createElement('select');
@@ -1430,12 +1700,18 @@ function loadNotificationsTab() {
     .then(([config, sounds]) => {
       // Same envelope shape as the Zones tab's GET /config read above --
       // our data lives under .configuration, not at the top level.
+      // notifications/defaultSound now live under profiles[activeProfile],
+      // not flat top-level keys (see index.js's profiles migration).
       const ourData = (config && config.configuration) || {};
-      notifRows = configToNotifRows(ourData.notifications);
-      notifDefaultSound = ourData.defaultSound || '';
+      activeProfile = ourData.activeProfile || 'Default';
+      profileNames = Object.keys(ourData.profiles || {});
+      const profile = (ourData.profiles && ourData.profiles[activeProfile]) || {};
+      notifRows = configToNotifRows(profile.notifications);
+      notifDefaultSound = profile.defaultSound || '';
       availableSounds = sounds;
       renderDefaultSoundSelect();
       renderNotifRows();
+      renderProfileBar();
     })
     .catch((err) => {
       const container = document.getElementById('notif-rows');
@@ -1494,3 +1770,423 @@ document.getElementById('notif-save-btn').addEventListener('click', () => {
 });
 
 loadNotificationsTab();
+
+// --- Profile bar: Save / Save as... / Load ------------------------------
+//
+// Wires up the previously non-functional stub (index.html's
+// #profile-select + #save-btn/#save-as-btn -- the old top comment in this
+// file said as much: "no click handlers, no profile logic yet"). A profile
+// now covers BOTH tabs' staged state (zones + notifications +
+// defaultSound), per index.js's profiles migration. Loading a profile only
+// ever changes STAGED state -- the same store autosave/notification-Save
+// already write into -- never SignalK directly, same as every other
+// Profile-side action in this app; only Commit/Send-to-server (unchanged)
+// ever pushes to the live server.
+
+function fetchProfileContent(name) {
+  return fetch('/plugins/signalk-alarms/profiles/' + encodeURIComponent(name)).then((r) => r.json());
+}
+
+function saveProfileContent(name, content) {
+  return fetch('/plugins/signalk-alarms/profiles/' + encodeURIComponent(name), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(content)
+  }).then((r) => r.json().then((data) => ({ ok: r.ok, data: data })));
+}
+
+function setActiveProfile(name) {
+  return fetch('/plugins/signalk-alarms/active-profile', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name })
+  }).then((r) => r.json().then((data) => ({ ok: r.ok, data: data })));
+}
+
+// Replaces the in-memory staged state for BOTH tabs from `content` and
+// re-renders both -- the one place that knows how to apply a profile's
+// content to the UI, used by Load (Replace/Merge) below. Also resets the
+// Zones tab's Server-comparison state (mismatchedPaths/refreshStatus/
+// sendStatus) -- a freshly loaded/switched profile hasn't been Refreshed
+// against Server yet, so any previous Refresh's badges would be stale
+// (they describe the OLD staged state's relationship to Server, not the
+// new one's), and collapses whichever row was expanded (its editableZones
+// belong to the profile that's about to stop being active).
+function applyProfileContentToTabs(content) {
+  defaultProfileZones = content.zones || {};
+  mismatchedPaths = null;
+  refreshStatus = null;
+  sendStatus = null;
+  expandedPath = null;
+  closeLiveValueSocket();
+  renderZonesList();
+  renderGlobalActions();
+
+  notifRows = configToNotifRows(content.notifications);
+  notifDefaultSound = content.defaultSound || '';
+  renderDefaultSoundSelect();
+  renderNotifRows();
+}
+
+// profileLoadPrompt: null (idle) | {name} -- the 3-way Replace/Merge/
+// Cancel prompt showing for a profile just picked in the dropdown, before
+// any of Replace/Merge/Cancel has actually been chosen yet.
+let profileLoadPrompt = null;
+let profileBarStatus = null; // {type:'pending'|'success'|'error', message}
+
+function fillProfileBarStatus() {
+  const el = document.getElementById('profile-bar-status');
+  if (!profileBarStatus) {
+    el.textContent = '';
+    el.className = 'profile-bar-status';
+    return;
+  }
+  el.textContent = profileBarStatus.message;
+  el.className = 'profile-bar-status profile-bar-status-' + profileBarStatus.type;
+}
+
+function renderProfileBar() {
+  const select = document.getElementById('profile-select');
+  select.innerHTML = '';
+  // While a Load prompt is pending, the dropdown should keep showing the
+  // just-picked (non-active) target name, not snap back to activeProfile --
+  // this rebuild runs on every renderProfileBar() call (including the one
+  // that opens the prompt itself), so without this the dropdown could never
+  // actually hold a non-active value long enough for the delete button
+  // (which reads select.value) to ever see one. Found via actually
+  // exercising this in a browser, not by inspection -- the delete button
+  // was silently targeting activeProfile instead of the intended pending
+  // profile until this fix.
+  const selectedName = profileLoadPrompt ? profileLoadPrompt.name : activeProfile;
+  profileNames.forEach((name) => {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    if (name === selectedName) opt.selected = true;
+    select.appendChild(opt);
+  });
+
+  const promptEl = document.getElementById('profile-load-prompt');
+  promptEl.innerHTML = '';
+  if (profileLoadPrompt) {
+    const text = document.createElement('span');
+    text.className = 'profile-load-prompt-text';
+    text.textContent = 'Load "' + profileLoadPrompt.name + '" — ';
+    promptEl.appendChild(text);
+
+    const replaceBtn = document.createElement('button');
+    replaceBtn.type = 'button';
+    replaceBtn.textContent = 'Replace everything';
+    replaceBtn.addEventListener('click', () => loadProfile(profileLoadPrompt.name, 'replace'));
+    promptEl.appendChild(replaceBtn);
+
+    const mergeBtn = document.createElement('button');
+    mergeBtn.type = 'button';
+    mergeBtn.textContent = 'Merge — only touch paths in this profile';
+    mergeBtn.addEventListener('click', () => loadProfile(profileLoadPrompt.name, 'merge'));
+    promptEl.appendChild(mergeBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.addEventListener('click', () => {
+      profileLoadPrompt = null;
+      select.value = activeProfile;
+      renderProfileBar();
+    });
+    promptEl.appendChild(cancelBtn);
+  }
+
+  fillProfileBarStatus();
+}
+
+// mode: 'replace' overwrites the staged zones/notifications/defaultSound
+// entirely with the loaded profile's own content -- nothing needs
+// persisting first, since that content already IS what's stored under
+// `name`, unchanged. mode: 'merge' overwrites only the keys present in the
+// loaded profile (plain object spread, loaded profile's keys win),
+// leaving every other currently-staged path untouched -- this produces a
+// genuinely new combination that doesn't equal either source, so it's
+// POSTed back to profiles/<name> to actually become that profile's new
+// stored content (matching "this only updates staged state" -- staged
+// state, in this app's existing model, IS whatever's in
+// profiles[activeProfile]). Either way, activeProfile becomes `name`
+// afterward -- never touches SignalK.
+function loadProfile(name, mode) {
+  profileLoadPrompt = null;
+  profileBarStatus = { type: 'pending', message: 'Loading "' + name + '"...' };
+  renderProfileBar();
+
+  fetchProfileContent(name)
+    .then((loaded) => {
+      const content =
+        mode === 'replace'
+          ? { zones: loaded.zones || {}, notifications: loaded.notifications || {}, defaultSound: loaded.defaultSound || null }
+          : {
+              zones: Object.assign({}, defaultProfileZones, loaded.zones || {}),
+              notifications: Object.assign({}, notifRowsToConfig(notifRows), loaded.notifications || {}),
+              defaultSound:
+                loaded.defaultSound !== null && loaded.defaultSound !== undefined ? loaded.defaultSound : notifDefaultSound || null
+            };
+
+      const persisted = mode === 'merge' ? saveProfileContent(name, content) : Promise.resolve({ ok: true, data: content });
+      return persisted.then(({ ok, data }) => {
+        if (!ok) throw new Error(data.error || 'Failed to save merged profile');
+        return content;
+      });
+    })
+    .then((content) => {
+      applyProfileContentToTabs(content);
+      return setActiveProfile(name);
+    })
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Failed to set active profile');
+      activeProfile = name;
+      profileBarStatus = { type: 'success', message: 'Loaded "' + name + '".' };
+      renderProfileBar();
+    })
+    .catch((err) => {
+      profileBarStatus = { type: 'error', message: err.message };
+      renderProfileBar();
+    });
+}
+
+document.getElementById('profile-select').addEventListener('change', (e) => {
+  const name = e.target.value;
+  if (name === activeProfile) return;
+  // Avoid conflicting inline prompts open at once -- picking a different
+  // profile while Save As or a delete-confirm happens to be open closes
+  // them rather than leaving several visible in the same bar.
+  saveAsPrompt = null;
+  renderSaveAsPrompt();
+  deleteConfirm = null;
+  renderDeleteConfirm();
+  profileLoadPrompt = { name: name };
+  renderProfileBar();
+});
+
+document.getElementById('save-btn').addEventListener('click', () => {
+  profileBarStatus = { type: 'pending', message: 'Saving "' + activeProfile + '"...' };
+  renderProfileBar();
+  saveProfileContent(activeProfile, currentStagedProfileContent())
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Save failed');
+      profileBarStatus = { type: 'success', message: 'Saved "' + activeProfile + '".' };
+      renderProfileBar();
+    })
+    .catch((err) => {
+      profileBarStatus = { type: 'error', message: err.message };
+      renderProfileBar();
+    });
+});
+
+// saveAsPrompt: null (idle) | {} (input showing) -- the typed name itself
+// lives in the input element, not mirrored into this state, same as how
+// e.g. the Notifications tab's row inputs read their own .value directly
+// rather than tracking every keystroke in a parallel variable (nothing
+// here needs to survive a re-render the way editableZones does).
+let saveAsPrompt = null;
+
+// Renders independently of renderProfileBar() -- deliberately never called
+// from it. renderProfileBar() can fire from unrelated async completions
+// (Load succeeding, Save's own status, etc.); if it also rebuilt this
+// container every time, any one of those firing while the user is mid-type
+// here would blow the input away and drop focus, the same class of bug
+// CLAUDE.md's gotchas already call out elsewhere in this app (the WS-tick
+// full-re-render issue). Keeping this container's lifecycle solely in the
+// hands of the buttons/keys that actually open, submit, or cancel it avoids
+// that entirely.
+function renderSaveAsPrompt() {
+  const container = document.getElementById('profile-save-as-prompt');
+  container.innerHTML = '';
+  if (!saveAsPrompt) return;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'profile-save-as-input';
+  input.placeholder = 'New profile name';
+
+  const warning = document.createElement('span');
+  warning.className = 'profile-save-as-warning';
+
+  // Live, in-place update on every keystroke -- same pattern as the Zones
+  // tab's unit-conversion hints next to lower/upper inputs -- rather than a
+  // full renderSaveAsPrompt() per keystroke, which would just be rebuilding
+  // the very input the user is typing into.
+  function updateWarning() {
+    const trimmed = input.value.trim();
+    warning.textContent = trimmed && profileNames.includes(trimmed) ? 'This will overwrite an existing profile.' : '';
+  }
+
+  input.addEventListener('input', updateWarning);
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      submitSaveAs(input.value);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      saveAsPrompt = null;
+      renderSaveAsPrompt();
+    }
+  });
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', () => submitSaveAs(input.value));
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => {
+    saveAsPrompt = null;
+    renderSaveAsPrompt();
+  });
+
+  container.appendChild(input);
+  container.appendChild(warning);
+  container.appendChild(saveBtn);
+  container.appendChild(cancelBtn);
+
+  input.focus(); // pre-focused, per spec
+}
+
+// Empty/whitespace-only names are rejected silently (no error message --
+// there's nothing meaningful to say beyond "you didn't type anything"),
+// same not-yet-used treatment blank rows already get elsewhere in this
+// app. The overwrite warning above is advisory only, not a second
+// confirmation gate -- typing a name that collides with an existing
+// profile and hitting Save still overwrites it, same as the old
+// window.prompt flow always did; this only makes that visible beforehand
+// instead of silent.
+function submitSaveAs(rawName) {
+  const trimmed = (rawName || '').trim();
+  if (!trimmed) return;
+
+  saveAsPrompt = null;
+  renderSaveAsPrompt();
+
+  profileBarStatus = { type: 'pending', message: 'Saving as "' + trimmed + '"...' };
+  renderProfileBar();
+  saveProfileContent(trimmed, currentStagedProfileContent())
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Save failed');
+      return setActiveProfile(trimmed);
+    })
+    .then(({ ok, data }) => {
+      if (!ok) throw new Error(data.error || 'Failed to set active profile');
+      activeProfile = trimmed;
+      if (!profileNames.includes(trimmed)) profileNames.push(trimmed);
+      profileBarStatus = { type: 'success', message: 'Saved as "' + trimmed + '" and switched to it.' };
+      renderProfileBar();
+    })
+    .catch((err) => {
+      profileBarStatus = { type: 'error', message: err.message };
+      renderProfileBar();
+    });
+}
+
+document.getElementById('save-as-btn').addEventListener('click', () => {
+  deleteConfirm = null;
+  renderDeleteConfirm();
+  saveAsPrompt = {};
+  renderSaveAsPrompt();
+});
+
+// --- Delete profile ------------------------------------------------------
+//
+// The delete button always targets document.getElementById('profile-
+// select').value -- i.e. whatever the dropdown is CURRENTLY showing, not a
+// separately-tracked "selected for deletion" name. In practice that's
+// always activeProfile, except for the brief window where the user has
+// just picked a different profile in the dropdown and the Replace/Merge/
+// Cancel prompt is showing but not yet resolved -- clicking Delete there
+// targets that pending, not-yet-loaded, non-active name, which is the only
+// way this UI lets a non-active profile actually reach the dropdown's
+// current value (Cancel reverts it back to activeProfile otherwise).
+
+function deleteProfileRequest(name) {
+  return fetch('/plugins/signalk-alarms/profiles/' + encodeURIComponent(name), { method: 'DELETE' }).then((r) =>
+    r.json().then((data) => ({ ok: r.ok, data: data }))
+  );
+}
+
+// deleteConfirm: null (idle) | {name} -- the inline "delete this?" prompt
+// for a non-active profile. Rendered independently of renderProfileBar(),
+// same reasoning as renderSaveAsPrompt above (nothing here has a text
+// input to protect mid-type, but keeping the pattern consistent rather
+// than making this one case special).
+let deleteConfirm = null;
+
+function renderDeleteConfirm() {
+  const container = document.getElementById('profile-delete-prompt');
+  container.innerHTML = '';
+  if (!deleteConfirm) return;
+
+  const text = document.createElement('span');
+  text.className = 'profile-delete-prompt-text';
+  text.textContent = 'Delete profile "' + deleteConfirm.name + '"? This cannot be undone.';
+  container.appendChild(text);
+
+  const confirmBtn = document.createElement('button');
+  confirmBtn.type = 'button';
+  confirmBtn.textContent = 'Delete';
+  confirmBtn.addEventListener('click', () => {
+    const name = deleteConfirm.name;
+    deleteConfirm = null;
+    renderDeleteConfirm();
+    profileBarStatus = { type: 'pending', message: 'Deleting "' + name + '"...' };
+    renderProfileBar();
+    deleteProfileRequest(name)
+      .then(({ ok, data }) => {
+        if (!ok) throw new Error(data.error || 'Delete failed');
+        profileNames = profileNames.filter((n) => n !== name);
+        // The dropdown may still be showing the just-deleted name (it was
+        // the pending, not-yet-loaded Load target -- see the comment
+        // above) -- fall back to activeProfile, which always still exists.
+        document.getElementById('profile-select').value = activeProfile;
+        profileLoadPrompt = null;
+        profileBarStatus = { type: 'success', message: 'Deleted "' + name + '".' };
+        renderProfileBar();
+      })
+      .catch((err) => {
+        profileBarStatus = { type: 'error', message: err.message };
+        renderProfileBar();
+      });
+  });
+  container.appendChild(confirmBtn);
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => {
+    deleteConfirm = null;
+    renderDeleteConfirm();
+  });
+  container.appendChild(cancelBtn);
+}
+
+document.getElementById('delete-profile-btn').addEventListener('click', () => {
+  const name = document.getElementById('profile-select').value;
+
+  // Both checks mirror the backend's own two rejections (index.js's DELETE
+  // /profiles/:name) -- checked client-side first so the reason shows up
+  // immediately rather than after a round trip, but the backend still
+  // enforces both regardless (e.g. if activeProfile changed from another
+  // tab/session between page load and this click).
+  if (name === activeProfile) {
+    profileBarStatus = { type: 'error', message: 'Can\'t delete "' + name + '" -- it\'s the active profile. Switch to a different profile first.' };
+    renderProfileBar();
+    return;
+  }
+  if (profileNames.length <= 1) {
+    profileBarStatus = { type: 'error', message: 'Can\'t delete the last remaining profile.' };
+    renderProfileBar();
+    return;
+  }
+
+  saveAsPrompt = null;
+  renderSaveAsPrompt();
+  deleteConfirm = { name: name };
+  renderDeleteConfirm();
+});
