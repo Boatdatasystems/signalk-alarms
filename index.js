@@ -547,6 +547,29 @@ module.exports = function (app) {
       res.json(values);
     });
 
+    // Bulk units metadata for every known path in one request -- backs the
+    // Zones tab's display-only unit-conversion hint (K -> °C, rad -> °,
+    // ratio -> %) while entering bounds and when listing a path's existing
+    // zones. Fetched once at tab load alongside /values, not per-row-expand
+    // -- reuses the exact same bulk-tree-walk approach as /live-zones/
+    // /values above (the units field just rides along in the same node
+    // already being walked) rather than a new per-path meta mechanism.
+    // Purely additive: doesn't change /values' existing shape, so nothing
+    // that already reads it needs to change.
+    router.get('/units', (req, res) => {
+      const tree = app.getPath('vessels.' + app.selfId) || {};
+      const paths = app.streambundle.getAvailablePaths();
+      const unitsByPath = {};
+      paths.forEach((path) => {
+        if (!path) return;
+        const node = path
+          .split('.')
+          .reduce((obj, key) => (obj && typeof obj === 'object' ? obj[key] : undefined), tree);
+        unitsByPath[path] = node && node.meta && typeof node.meta.units === 'string' ? node.meta.units : null;
+      });
+      res.json(unitsByPath);
+    });
+
     // Lists the actual .wav files present in the sounds directory on disk --
     // the Notifications tab's dropdown is populated from this, never a
     // hardcoded list, per the same "typo'd path here is a real failure mode"

@@ -34,6 +34,12 @@ let allPaths = [];
 let defaultProfileZones = {};
 let expandedPath = null;
 
+// path -> units string (or null), bulk-loaded once at tab load (GET /units)
+// same as defaultProfileZones -- display-only, feeds formatWithUnit() for
+// the live-typing hint and existing-zone boundary labels below. Never read
+// by persist-zone/commit-zone -- storage stays raw SI regardless of this.
+let pathUnits = {};
+
 // liveFetchError: only relevant for whichever row is currently expanded
 // (accordion is single-open). Surfaces a "Get live" failure (bad fetch or
 // failed persist) as an error message -- no more separate "live preview"
@@ -148,13 +154,38 @@ function pathSource(path) {
   return path.split('.')[0];
 }
 
-function formatNumber(value) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(3);
+// Display-only unit conversion, reused for all three surfaces that show a
+// raw SI number to a human: the Zones tab's live-typing hint, its existing-
+// zone boundary labels, and (below) the "Current value" readout -- one
+// conversion table, not three. Storage/commit always stays in raw SI, this
+// never feeds back into what gets sent to persist-zone/commit-zone. Units
+// not explicitly handled here (V, A, m, ...) fall through to the plain
+// rawValue, unconverted -- no guessing at conversions this doesn't know
+// about.
+function formatWithUnit(rawValue, units) {
+  if (typeof rawValue !== 'number' || isNaN(rawValue)) return '';
+  switch (units) {
+    case 'K':
+      return `${rawValue} (${(rawValue - 273.15).toFixed(1)}°C)`;
+    case 'rad':
+      return `${rawValue} (${((rawValue * 180) / Math.PI).toFixed(1)}°)`;
+    case 'ratio':
+      return `${rawValue} (${(rawValue * 100).toFixed(0)}%)`;
+    case 'm/s':
+      return `${rawValue} (${(rawValue * 1.94384449).toFixed(1)}kt)`;
+    default:
+      return `${rawValue}`;
+  }
 }
 
-function formatLiveValue(value) {
+// Non-number live values (a path with no data yet reports undefined,
+// handled separately by the readout's own "no data yet" text; anything
+// object/string-shaped is a defensive fallback, not expected for this
+// tab's numeric-only path list) fall back to JSON.stringify rather than
+// going through formatWithUnit at all.
+function formatLiveValue(value, units) {
   if (typeof value === 'number') {
-    return formatNumber(value);
+    return formatWithUnit(value, units);
   }
   return JSON.stringify(value);
 }
@@ -196,13 +227,17 @@ function openLiveValueSocket(path) {
         if (v.path === path) {
           liveValue = v.value;
           liveValueError = null;
-          // Update the readout text in place rather than a full
-          // renderZonesList(). A streaming path ticks this every ~1s
-          // (the subscription period below) -- a full re-render would tear
-          // down and rebuild every input in the row on each tick, stealing
-          // focus and dropping keystrokes out from under anyone actively
-          // typing into the zone inputs just below it.
+          // Update the readout text AND the bar's live-value marker in
+          // place rather than a full renderZonesList(). A streaming path
+          // ticks this every ~1s (the subscription period below) -- a full
+          // re-render would tear down and rebuild every input in the row on
+          // each tick, stealing focus and dropping keystrokes out from
+          // under anyone actively typing into the zone inputs just below
+          // it. updateZoneBars() only swaps the bar wrapper itself (see its
+          // own comment), so it's exposed to the exact same tick-frequency
+          // constraint as the readout and is safe here for the same reason.
           updateLiveValueReadout();
+          updateZoneBars(path);
         }
       });
     });
@@ -219,7 +254,13 @@ function openLiveValueSocket(path) {
 
 function fillLiveValueReadout(el) {
   el.classList.toggle('zone-bar-error', !!liveValueError);
-  el.textContent = liveValueError || 'Current value: ' + (liveValue === undefined ? 'no data yet' : formatLiveValue(liveValue));
+  // liveValue is only ever populated for whichever path is currently
+  // expanded (see the WS handler above), so pathUnits[expandedPath] is the
+  // right lookup here without needing a separate path param threaded
+  // through both call sites (the initial render and the in-place WS-tick
+  // update in updateLiveValueReadout() below).
+  el.textContent =
+    liveValueError || 'Current value: ' + (liveValue === undefined ? 'no data yet' : formatLiveValue(liveValue, pathUnits[expandedPath]));
 }
 
 // In-place update, deliberately not a renderZonesList() call -- see the
@@ -573,11 +614,14 @@ function renderGlobalActions() {
   }
 }
 
-function buildBoundaryLabel(value, leftPercent) {
+// units, if given, formats the label via formatWithUnit() (e.g.
+// "273.15 (0.0°C)") instead of a bare number -- display only, see
+// formatWithUnit's own comment.
+function buildBoundaryLabel(value, leftPercent, units) {
   const label = document.createElement('span');
   label.className = 'zone-bar-boundary-label';
   label.style.left = leftPercent + '%';
-  label.textContent = formatNumber(value);
+  label.textContent = formatWithUnit(value, units);
   return label;
 }
 
@@ -588,8 +632,19 @@ function buildBoundaryLabel(value, leftPercent) {
 // numbers even for a single zone, let alone 2+ -- the full bar (28px tall,
 // full content width) has room. Callers are unaffected by the wrapper --
 // both just .appendChild() the return value, same as when this returned
-// the bar div directly.
-function buildZoneBar(zones, sizeClass, emptyMessage) {
+// the bar div directly. `units` (a path's meta.units, from pathUnits) is
+// only ever used for the 'full' labelsRow below -- mini never renders
+// labels at all, so there's nothing for it to affect there.
+//
+// `currentValue`, if a number within [lowest, highest], draws a live-value
+// marker on the bar -- same 'full'-only scoping as labels/units, since the
+// live value backing it is only ever known for whichever row is currently
+// expanded (see openLiveValueSocket) and mini/collapsed rows never open a
+// second live-value subscription for themselves. Reuses the exact
+// lowest/highest/span already computed below for the zone segments
+// themselves, rather than a separate coordinate system that could drift out
+// of alignment with them.
+function buildZoneBar(zones, sizeClass, emptyMessage, units, currentValue) {
   const wrapper = document.createElement('div');
   wrapper.className = 'zone-bar-wrapper ' + sizeClass;
 
@@ -641,15 +696,30 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
     // CLAUDE.md, not de-duplicated.
     if (labelsRow) {
       if (typeof zone.lower === 'number') {
-        labelsRow.appendChild(buildBoundaryLabel(zone.lower, ((zLower - lowest) / span) * 100));
+        labelsRow.appendChild(buildBoundaryLabel(zone.lower, ((zLower - lowest) / span) * 100, units));
       }
       if (typeof zone.upper === 'number') {
-        labelsRow.appendChild(buildBoundaryLabel(zone.upper, ((zUpper - lowest) / span) * 100));
+        labelsRow.appendChild(buildBoundaryLabel(zone.upper, ((zUpper - lowest) / span) * 100, units));
       }
     }
   });
 
   if (labelsRow) wrapper.appendChild(labelsRow);
+
+  // Live-value marker: only within [lowest, highest] -- outside that range
+  // (or no live value yet) means no marker at all, not clamped to an edge,
+  // per the explicit "omit, don't clamp" requirement. Appended after the
+  // segments so it paints on top of them (plain DOM order, no z-index
+  // needed) -- it's only 2px wide, so the sliver of segment it covers at
+  // any given moment is negligible, and its own title tooltip is more
+  // useful there than the segment's.
+  if (sizeClass === 'full' && typeof currentValue === 'number' && !isNaN(currentValue) && currentValue >= lowest && currentValue <= highest) {
+    const marker = document.createElement('div');
+    marker.className = 'zone-bar-value-marker';
+    marker.style.left = ((currentValue - lowest) / span) * 100 + '%';
+    marker.title = 'Current value: ' + formatWithUnit(currentValue, units);
+    bar.appendChild(marker);
+  }
 
   return wrapper;
 }
@@ -660,13 +730,21 @@ function buildZoneBar(zones, sizeClass, emptyMessage) {
 // updateSyncStatusBadges. Rebuilds each from the current
 // defaultProfileZones[path] and swaps it in, without touching anything
 // else in the row (inputs, buttons) -- called from saveProfileNow's async
-// completion, including the debounced-typing path, so it must never risk
-// stealing focus from an input mid-type the way a full renderZonesList()
-// would.
+// completion (including the debounced-typing path) AND from the live-value
+// WS tick handler below, so it must never risk stealing focus from an input
+// mid-type the way a full renderZonesList() would -- safe here since only
+// the bar wrapper itself (segments/labels/marker) is replaced, never the
+// inputs/buttons that live alongside it in the row.
+// liveValue is only meaningful for the 'full' bar of whichever path is
+// actually expanded (see openLiveValueSocket) -- a mini/thumbnail bar for
+// this same path, or a 'full' bar for some other path this selector
+// happens to also match, never gets a marker regardless of the current
+// global liveValue.
 function updateZoneBars(path) {
   document.querySelectorAll('.zone-bar-wrapper[data-bar-path="' + path + '"]').forEach((oldWrapper) => {
     const sizeClass = oldWrapper.classList.contains('mini') ? 'mini' : 'full';
-    const newWrapper = buildZoneBar(defaultProfileZones[path], sizeClass);
+    const currentValue = sizeClass === 'full' && path === expandedPath ? liveValue : undefined;
+    const newWrapper = buildZoneBar(defaultProfileZones[path], sizeClass, undefined, pathUnits[path], currentValue);
     newWrapper.dataset.barPath = path;
     oldWrapper.replaceWith(newWrapper);
   });
@@ -832,7 +910,7 @@ function renderZonesList() {
       // every other action here already keeps up to date. data-bar-path,
       // see updateZoneBars() -- same in-place-refresh pattern as the
       // thumbnail's mini bar above.
-      const mainBar = buildZoneBar(defaultProfileZones[path], 'full');
+      const mainBar = buildZoneBar(defaultProfileZones[path], 'full', undefined, pathUnits[path], liveValue);
       mainBar.dataset.barPath = path;
       body.appendChild(mainBar);
 
@@ -863,8 +941,22 @@ function renderZonesList() {
         lowerInput.type = 'number';
         lowerInput.placeholder = 'Lower (blank = unbounded)';
         lowerInput.value = zone.lower;
+
+        // Live unit-conversion hint, next to the input -- updates on every
+        // keystroke, not just on blur/save. A blank input is NOT "0"; an
+        // empty string would otherwise coerce to Number('') === 0 and show
+        // a bogus converted value for an unset bound.
+        const lowerHint = document.createElement('span');
+        lowerHint.className = 'unit-hint';
+        function updateLowerHint() {
+          const raw = lowerInput.value.trim();
+          lowerHint.textContent = formatWithUnit(raw === '' ? NaN : Number(raw), pathUnits[path]);
+        }
+        updateLowerHint();
+
         lowerInput.addEventListener('input', () => {
           editableZones[idx].lower = lowerInput.value;
+          updateLowerHint();
           scheduleAutosave(path, editableZones);
         });
 
@@ -872,8 +964,18 @@ function renderZonesList() {
         upperInput.type = 'number';
         upperInput.placeholder = 'Upper (blank = unbounded)';
         upperInput.value = zone.upper;
+
+        const upperHint = document.createElement('span');
+        upperHint.className = 'unit-hint';
+        function updateUpperHint() {
+          const raw = upperInput.value.trim();
+          upperHint.textContent = formatWithUnit(raw === '' ? NaN : Number(raw), pathUnits[path]);
+        }
+        updateUpperHint();
+
         upperInput.addEventListener('input', () => {
           editableZones[idx].upper = upperInput.value;
+          updateUpperHint();
           scheduleAutosave(path, editableZones);
         });
 
@@ -909,7 +1011,9 @@ function renderZonesList() {
         });
 
         zoneRow.appendChild(lowerInput);
+        zoneRow.appendChild(lowerHint);
         zoneRow.appendChild(upperInput);
+        zoneRow.appendChild(upperHint);
         zoneRow.appendChild(stateSelect);
         zoneRow.appendChild(removeBtn);
         editListEl.appendChild(zoneRow);
@@ -1058,9 +1162,10 @@ function loadZonesTab() {
   Promise.all([
     fetch('/plugins/signalk-alarms/paths').then((r) => r.json()),
     fetch('/plugins/signalk-alarms/config').then((r) => r.json()),
-    fetch('/plugins/signalk-alarms/values').then((r) => r.json())
+    fetch('/plugins/signalk-alarms/values').then((r) => r.json()),
+    fetch('/plugins/signalk-alarms/units').then((r) => r.json())
   ])
-    .then(([paths, config, values]) => {
+    .then(([paths, config, values, units]) => {
       // Zones apply to raw data paths, not notification paths — those
       // belong to Tab 2. Not specified in CLAUDE.md; excluding
       // "notifications.*" here is a judgment call, flagged in the summary.
@@ -1087,6 +1192,7 @@ function loadZonesTab() {
       const ourData = (config && config.configuration) || {};
       defaultProfileZones =
         (ourData.profiles && ourData.profiles.Default && ourData.profiles.Default.zones) || {};
+      pathUnits = units || {};
 
       populateSourceFilter(allPaths);
       renderGlobalActions();

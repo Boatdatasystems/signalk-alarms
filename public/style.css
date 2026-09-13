@@ -161,6 +161,25 @@ body {
   bottom: 0;
 }
 
+/* Live-value marker on the 'full' bar (see buildZoneBar in app.js) -- a
+   thin white line with a dark outline so it reads clearly against every
+   zone-state color (nominal/alert/warn/alarm/emergency) without matching
+   any of them. transform: translateX(-50%) centers it exactly on its
+   left% (same centering approach .zone-bar-boundary-label already uses)
+   rather than starting there. Stays within the bar's own top/bottom
+   (matching .zone-bar's height) since .zone-bar has overflow: hidden --
+   deliberately not protruding above/below, to avoid touching that
+   clipping behavior (it also keeps zone segments' rounded corners clean). */
+.zone-bar-value-marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  transform: translateX(-50%);
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.65);
+}
+
 /* Numeric boundary labels (CLAUDE.md "Zone boundary value labels on the
    bar") -- 'full' bar only, see buildZoneBar's comment in app.js for why
    the thumbnail doesn't get these. A plain row below the bar, one label per
@@ -283,6 +302,16 @@ body {
   font-size: 0.85rem;
   border: 1px solid #ccc;
   border-radius: 4px;
+}
+
+/* Live unit-conversion hint next to a lower/upper input (formatWithUnit) --
+   display only, e.g. "283 (10.0°C)". Empty when the input is blank or the
+   path has no units formatWithUnit knows how to convert. */
+.unit-hint {
+  font-size: 0.8rem;
+  color: #666;
+  font-family: monospace;
+  white-space: nowrap;
 }
 
 .commit-btn {
