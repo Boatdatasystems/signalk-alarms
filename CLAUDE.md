@@ -36,8 +36,10 @@ undocumented `Mode` attribute schema per alarm type). Decided to build our own i
   does this.
 - Alarm playback: pre-made **sound files**, not live TTS. Generate offline with `espeak-ng`
   (confirmed installed and working on the Pi: `espeak-ng -w alarm.wav "text"`), play at
-  alarm-time with `aplay` (part of `alsa-utils`, always present — deliberately avoiding
-  mpg321/festival/cvlc, see gotchas below).
+  alarm-time with `paplay --volume=65536` (see "Current status" — matches `pi-deck-tools`'
+  own proven-working critical-alert player on this hardware; the original plan here was
+  `aplay`, superseded once that precedent was found — deliberately avoiding
+  mpg321/festival/cvlc either way, see gotchas below).
 - **Scope decision:** sound-file binding is NOT limited to zones/notifications this plugin
   creates itself — it's general-purpose across `notifications.*`. Lives on Tab 2 (see "App
   structure" above). This effectively absorbs the job `signalk-notification-player` was doing
@@ -63,40 +65,53 @@ Two-tab webapp:
   This is where the generalized sound-binding scope decision (below, and in "Ours to build")
   actually lives in the UI.
 
-## Data model — decided
+## Data model — decided, implemented
 
-Two stores, kept separate:
-
-- **`pathSettings`** — outside any profile, same regardless of which one is active:
-  `{ [path]: { min, max, contiguous: boolean } }`. Per-path display/edit config (track scale,
-  coupled-vs-decoupled), decided earlier to NOT vary by profile.
-- **`profiles`** — named and switchable. Each one is a full snapshot spanning both tabs:
-  ```
+```
+{
+  activeProfile: "Default",
+  pathSettings: { [path]: { min, max, contiguous: boolean } },
   profiles: {
-    "Anchored": {
-      zones:  { "environment.wind.speedApparent": [{lower, upper, state, message}, ...] },
-      sounds: { "environment.wind.speedApparent": { alert: "wind.wav" },
-                "notifications.navigation.anchor": { emergency: "anchor.wav" } }
+    "Default": {
+      zones:         { [path]: [{ state, lower, upper, message }, ...] },
+      notifications: { ["notifications." + path]: { [state]: { sound, mode, intervalSeconds } } },
+      defaultSound:  "default.wav" | null
     },
-    "Coastal": { zones: {...}, sounds: {...} }
+    "Coastal": { zones: {...}, notifications: {...}, defaultSound: "..." }
   }
-  ```
-  `zones` and `sounds` are independently keyed by path — a path can be in one, the other, or
-  both (the anchor alarm is `sounds`-only, since it has no zone this plugin manages).
-- **Resolved, and it changes the plan for the better:** Commit writes `meta.zones` directly
-  via `app.handleMessage()` from our own plugin backend — no cross-plugin config writes
+}
+```
+
+- **`pathSettings`** — outside any profile, same regardless of which one is active. Per-path
+  display/edit config (track scale, coupled-vs-decoupled), decided earlier to NOT vary by
+  profile. Not actually populated by any UI yet — see "Not yet decided" below.
+- **`profiles`** — named and switchable, each a full snapshot spanning both tabs. A path can
+  be in `zones`, `notifications`, both, or neither (the anchor alarm is `notifications`-only,
+  since it has no zone this plugin manages). `notifications` keys are always the FULL
+  `notifications.*` path (e.g. `notifications.navigation.anchor`), matching what a real
+  delta's path actually is — enforced on save both client- and server-side (see "Tab 2" below).
+  `activeProfile` names whichever profile is currently staged/live in the UI; every
+  autosave/Commit/notification-save reads and writes through it rather than a hardcoded name.
+- **This supersedes an earlier, short-lived split** where `notifications`/`defaultSound` lived
+  flat at the top level instead of per-profile, and `sounds: {}` sat as a dead, never-used
+  stub inside each profile. A one-time, idempotent migration in `index.js` (`migrateConfig`,
+  runs on every `plugin.start()`) moves any legacy top-level data into `profiles.Default`,
+  drops the `sounds` stub, and fixes any `notifications` key that's missing its
+  `notifications.` prefix (a real dead-config bug this surfaced — such a key can never match a
+  live delta).
+- Commit writes `meta.zones` directly via `app.putSelfPath()` (see the gotchas below for why
+  not `app.handleMessage()`) from our own plugin backend — no cross-plugin config writes
   needed at all. Confirmed empirically (installed signalk-server 2.32.0 AND the Pi's exact
   2.31.1 separately, ran both live, forced a real boundary crossing over a WS delta): core's
   own native `Zones` class watches `meta.zones` on every path and fires real notifications on
-  crossing, independent of `zones-edit`/`@signalk/zones` entirely — see "Architecture" above
-  and the double-fire gotcha below. `zones-edit` is NOT used by this plugin at all, going
-  forward. Zone entries still reuse `@signalk/zones`' own field names (`lower`, `upper`,
-  `state`, `message`) purely because that's the shape core's native watcher expects in
+  crossing, independent of `zones-edit`/`@signalk/zones` entirely. `zones-edit` is NOT used by
+  this plugin at all. Zone entries still reuse `@signalk/zones`' own field names (`lower`,
+  `upper`, `state`, `message`) purely because that's the shape core's native watcher expects in
   `meta.zones` — not because we're writing through that plugin.
 - We do NOT use `@signalk/zones`' own `method` field for sound — our plugin subscribes to
-  `notifications.*` broadly and looks up `sounds[path][state]` itself (per the earlier scope
-  decision), so `zones` and `sounds` are linked only by path + state at runtime, not by any
-  direct reference between the two stores.
+  `notifications.*` broadly and looks up `notifications[path][state]` itself, so zones and
+  sound bindings are linked only by path + state at runtime, not by any direct reference
+  between the two stores.
 
 ## SUPERSEDED — see "Two-state model: Server vs. Profile" below
 
@@ -108,11 +123,11 @@ Two stores, kept separate:
 Two states only, not three — the earlier "draft" layer (unsaved, in-browser-only edits) is
 retired entirely. **Implemented and verified — see "Current status".**
 - **Server** — live `meta.zones`, the real boat, evaluated by SignalK core.
-- **Profile** — our own persisted config (`profiles.Default.zones`). Auto-saves continuously
-  as you edit (add/remove/change a zone in a row) — debounced (600ms) for the lower/upper text
-  inputs, immediate for discrete actions (state dropdown, Remove) — not a write per keystroke.
-  No separate unsaved-draft state to lose or discard — the existing Save/Save-as
-  profile-snapshot mechanism (see "App structure") is meant to be the only "undo point", not a
+- **Profile** — our own persisted config (`profiles[activeProfile].zones`). Auto-saves
+  continuously as you edit (add/remove/change a zone in a row) — debounced (600ms) for the
+  lower/upper text inputs, immediate for discrete actions (state dropdown, Remove) — not a
+  write per keystroke. No separate unsaved-draft state to lose or discard — the Save/Save-as
+  profile-snapshot mechanism (see "Profiles" below) is meant to be the only "undo point", not a
   per-row cancel.
 
 Four actions, each a one-directional move between exactly two of {Server, Profile, the
@@ -132,6 +147,13 @@ on-screen row}:
   differing. Confirms first with a count only ("Send N changed paths to the server" — no full
   path list needed, a custom in-page confirm/cancel rather than a native `confirm()` dialog).
   Re-checks the diff at send time rather than trusting a possibly-stale earlier Refresh click.
+  Before that count-confirm, an additional guard checks whether the currently-staged
+  {zones, notifications, defaultSound} deep-equals ANY saved profile (not just the active
+  one — a Merge, see "Profiles" below, can produce a combination matching neither source it
+  came from). If it matches none, offers "Save and send" / "Send without saving" / Cancel
+  first, so an unsaved edit can't get pushed to Server without at least being asked about.
+  Doesn't change what gets pushed (still zones only, via the same `putSelfPath` commit path) —
+  purely a confirmation step in front of the existing flow.
 
 Get Live/Send-to-server are the same direction (Server→Profile) at row-scope vs. all-scope;
 Commit/Send-to-server are the same direction (Profile→Server) at row-scope vs. all-scope.
@@ -170,10 +192,10 @@ the same now-removed `liveZones`-preferring render branch.
   twice tonight (see gotchas).
 - **Don't write to the live zone meta on every drag tick, or even on release.** Show drag
   position locally only. A per-row **Commit** button is the sole point that pushes this
-  path's edited zone bounds live — writes `meta.zones` directly via `app.handleMessage()`;
-  SignalK core's own native zone watcher does the actual evaluation, see "Data model" above
-  — lets you drag both edges around and iterate freely before anything touches the real,
-  currently-running alarm system.
+  path's edited zone bounds live — writes `meta.zones` directly via `app.putSelfPath()` (see
+  "Current status" for why not `app.handleMessage()`); SignalK core's own native zone watcher
+  does the actual evaluation, see "Data model" above — lets you drag both edges around and
+  iterate freely before anything touches the real, currently-running alarm system.
 - Show the **live current value** as a marker on the same track (cheap to add since we're
   already subscribed to the path's delta stream; useful at-a-glance feedback while setting
   thresholds).
@@ -405,455 +427,113 @@ scheduled.
 
 ## Current status
 
-- Initial plugin skeleton built and verified: `package.json` (zero dependencies), `index.js`
-  (plugin lifecycle + `pathSettings`/`profiles` persistence), and the two-tab static webapp
-  shell (profile bar, working tab-switch JS).
-- `index.js` now seeds `profiles` as `{ "Default": { zones: {}, sounds: {} } }` on first run
-  (when persisted `profiles` is empty) instead of `{}` — the scaffold session's flagged gap is
-  closed, and the webapp's hardcoded "Default" profile-bar option now corresponds to a real
-  stored profile.
-- Backend now exposes `GET /plugins/signalk-alarms/paths` (via `plugin.registerWithRouter`),
-  returning `app.streambundle.getAvailablePaths()` as JSON — see the route-registration gotcha
-  above.
-- Tab 1 (Zones) is now a working list/filter/accordion shell: text search + a source `<select>`
-  populated dynamically from the distinct top-level segments of whatever `/paths` actually
-  returns (no hardcoded option list), rows expand accordion-style (one open at a time) showing
-  a static, non-interactive colored zone bar read from `profiles["Default"].zones[path]`. No
-  drag interaction, live value marker, or real Commit yet — those are still follow-up work.
-  Notifications tab untouched.
-- Verified end-to-end against a scratch local signalk-server 2.32.0 install, symlinked in
-  (mirrors the deploy pattern above, not npm-installed): loads with correct keywords/schema,
-  starts cleanly, persists config in the correct (non-nesting) shape across restarts, `/paths`
-  returns real data, the Zones tab's search/source filter both genuinely narrow that real data,
-  accordion single-open behavior confirmed, no server-log or browser-console errors. Nothing
-  touched on the actual Pi for this.
-- Local git repo initialized under `github.com/Boatdatasystems/signalk-alarms`, pushed to
-  `main`.
-- **Open, not yet decided:**
-  - Where/how a path's display range (`pathSettings[path].min/max`) actually gets set — no UI
-    exists for this yet. The Zones tab's static zone bar currently auto-fits its scale to the
-    zone entries' own `lower`/`upper` bounds when zones exist (virtually never right now, since
-    `Default` seeds with empty `zones`), which is a display-only stopgap, not the real editor
-    scale from the "Tab 1 — Zones" section above.
-  - Zone-state color palette in the Zones tab (`nominal`=green, `alert`=yellow, `warn`=orange,
-    `alarm`=red, `emergency`=purple) is my own placeholder choice, not verified against Kip's
-    actual gauge-zone palette referenced in "Tab 1 — Zones: editor UI decided" above — cosmetic,
-    easy to change later.
-- Each expanded Zones-tab row now has a read-only **"Get live" button** (per the "Tab 1 — Zones"
-  section's "Get live" decision above): fetches `GET
-  /plugins/signalk-alarms/live-meta?path=<path>` (backed by `app.getSelfPath(path + '.meta')`,
-  see that section for why not the REST `/meta` endpoint) and re-renders that row's zone bar
-  from live data instead of `profiles["Default"].zones[path]`, labelled "LIVE (FROM SERVER)"
-  in blue with a matching outline on the bar itself vs. "STORED (DEFAULT PROFILE)" in the
-  default state. A path with no live zones shows "No live zones for this path." distinctly from
-  the stored-empty message ("No zones defined for this path yet."). This is the read-only
-  preview only — not wired into any editor state, since there's no drag editor yet to pull
-  into; that integration is follow-up work once Commit/drag exists.
-  - Verified against a manually-injected real zone (sent a delta with a `meta` array over the
-    server's WebSocket input stream, since the REST API has no POST for setting meta) on
-    `environment.wind.speedApparent`: "Get live" retrieved and rendered it correctly, a
-    zone-less path showed the clean empty state, zero browser console messages, zero
-    server-log errors.
-  - "Get live" appears on every row shown, same as the row itself — see path-type filtering
-    below, which now determines which rows exist in the first place.
-- **`app.getMetadata(path)` checked, confirmed to wrap the static package — see the gotcha
-  above.** No code change; this just settles the open question from last session with
-  certainty instead of "avoided as a precaution."
-- **Path-type filtering resolved** (closes the question flagged in the last two sessions).
-  New `GET /plugins/signalk-alarms/values` endpoint returns a one-shot `{path: currentValue}`
-  snapshot for every known path (`app.getPath('vessels.' + app.selfId)`, walked per path — see
-  the gotcha above on why plain `'vessels.self'` doesn't work with this particular API). The
-  Zones tab now excludes a path only if its snapshotted value is confirmed non-numeric
-  (string, object, or boolean); a path absent from the snapshot (never reported a value) stays
-  included, since that's a different, weaker claim than "confirmed non-numeric."
-  - **Real-world finding, worth knowing before relying on the "path with no data" case again:**
-    tried to manufacture a live example (a path known to `getAvailablePaths()` but with no
-    current value) and could not — by design. `streambundle.js`'s `push()` only adds a path to
-    `availableSelfPaths` (what `getAvailablePaths()` returns) on a real **value** delta, never
-    a meta-only one; the source has an explicit comment about this (avoiding pre-registered
-    schema templates, e.g. the Weather provider's, polluting the list). Confirmed by sending a
-    meta-only delta for a brand-new path over the WS input stream: it didn't show up in
-    `/paths` OR `/values` at all — not "present with no value," just absent entirely. So on
-    this server, "listed but valueless" isn't a reachable steady state under normal operation;
-    the code still handles it correctly (verified with a direct synthetic test of the filter
-    predicate: number → keep, `0` → keep, `undefined` → keep, string/object/boolean → exclude)
-    in case that ever changes or some other path produces the gap.
-- **Live value marker, per expanded row.** Opens one WebSocket subscription
-  (`/signalk/v1/stream?subscribe=none`, then `{context: 'vessels.self', subscribe: [{path,
-  period: 1000}]}` — confirmed against `src/subscriptionmanager.js` and `src/interfaces/ws.js`,
-  not assumed) when a row expands, shows the current value as plain text near the bar, closes
-  the socket on collapse or when a different row is expanded. Verified live: expanding
-  `environment.wind.speedApparent` (continuously streaming from the demo data generator) showed
-  an initial value that visibly updated a few seconds later; confirmed via a runtime
-  `WebSocket` wrapper (not just visual inspection) that switching rows closes the previous
-  socket before opening the next, and collapsing closes it too — never more than one open at
-  once, never left dangling.
-- Zero browser console messages and zero server-log errors across this whole session
-  (getMetadata check, `/values` endpoint including the debugging false start on
-  `'vessels.self'`, filtering, and the live value marker).
-- **Minimal real Commit, working end-to-end.** Each expanded Zones-tab row now has plain
-  numeric inputs (lower, upper, state dropdown — `nominal`/`alert`/`warn`/`alarm`/`emergency`)
-  and a real **Commit** button, per the "Tab 1 — Zones" Commit decision and the direct-meta-write
-  mechanism confirmed under "Architecture"/"Data model" above. Not drag — that's still deferred.
-  `POST /plugins/signalk-alarms/commit-zone` validates the input, writes `meta.zones` for the
-  path via `app.handleMessage()`, and updates `profiles.Default.zones[path]` in the persisted
-  config to match.
-  - Verified against the scratch signalk-server 2.32.0 install, both by direct API call and
-    through the actual browser UI: committed a zone on `navigation.speedOverGround` (lower: 3,
-    state: alarm) via the real Commit button, then confirmed a genuine
-    `notifications.navigation.speedOverGround` delta existed server-side with the correct
-    `state`. Separately (direct API, `test.alarms.commitButtonValue`), fed WS deltas crossing
-    the committed boundary (5 → 20 across a lower:25 alarm zone) and watched the notification
-    flip `normal` → `alarm` with a single, stable notification `id` — no double-fire, confirming
-    the retirement of the `zones-edit` path (see gotchas) actually holds in practice, not just
-    in theory. "Get live" correctly reflects a just-committed zone (allow it a moment — meta
-    propagation into the tree `getSelfPath` reads isn't instant; a raw `/live-meta` check inside
-    500ms of commit saw stale `null` once, populated correctly a few seconds later).
-  - **Real bug found and fixed during this session's browser verification, not just a
-    hypothetical:** the live-value WebSocket handler was calling the full `renderZonesList()`
-    on every incoming delta. For a continuously-streaming path (i.e. exactly the kind of path
-    someone would actually be setting an alarm on) that's roughly once a second — each tick
-    was tearing down and rebuilding every DOM node in the expanded row, including the Commit
-    inputs, stealing focus and silently dropping whatever was mid-typed. Caught by trying to
-    type a lower bound into a streaming path's row via browser automation and watching the
-    field stay empty across repeated attempts despite `type` reporting success. Fixed by
-    updating the `#live-value-readout` element's text in place (`updateLiveValueReadout()`)
-    instead of a full re-render; confirmed by typing into the Lower field on a live-streaming
-    row and watching the value survive several value ticks before Commit.
-  - `zones-edit`'s own config on the Pi checked (read-only, before touching anything) ahead of
-    deploy: `{enabled: false, configuration: {}}` — disabled, empty. It IS actually installed
-    (`~/.signalk/node_modules/@signalk/zones`, listed in `~/.signalk/package.json`) — an initial
-    flat `ls | grep zone` missed it because it's nested under the `@signalk` scope directory,
-    corrected once actually checked. Disabled means `plugin.start()` never runs, so no
-    `options.zones` subscription and no meta side-effect write from it either way — the
-    double-notification risk flagged in the gotchas below is genuinely theoretical for this boat
-    right now, not a live pre-existing bug, but would become real if `zones-edit` is ever
-    manually re-enabled and configured via the stock admin UI for some other reason.
+Everything below is shipped, deployed to the Pi, and verified live (both via direct API/WS
+testing and, for the frontend, actual browser interaction) unless marked otherwise. This
+section is a snapshot of what's true now — see `SESSION-LOG.md` for the chronological
+"what happened, in what order" trail and `git log` for exact history.
 
-- **Deployed to the Pi and proven live.** Followed the deploy pattern above exactly: `scp -r`
-  to `~/signalk-alarms/`, symlinked into `~/.signalk/node_modules/signalk-alarms/`, added
-  `"signalk-alarms": "file:../signalk-alarms"` to `~/.signalk/package.json` (backed the file up
-  first), `sudo systemctl restart signalk.service`. Loaded cleanly — `active (running)`, same
-  PID throughout all subsequent testing, no crash or restart.
-  - **New finding, not previously documented:** unlike the scratch server, the Pi has
-    server-level security enabled — our own plugin's routes 401 without auth, same as every
-    other route. This is correct, expected behavior (the webapp itself works fine through a
-    browser that's already logged into the SignalK admin UI, via the normal session cookie) —
-    just hadn't come up before since the scratch server has no security configured. For
-    scripted verification, used the documented `signalk-generate-token -u <user> -e 1h -s
-    security.json` CLI (run over SSH) to mint a short-lived token — read the username from
-    `security.json` (`openplotter`) without ever touching the actual password, which stays
-    hashed in that file regardless.
-  - **Test path: `test.test`.** Chose it because it's a pre-existing Node-RED-sourced scaffold
-    path (`$source: signalk-node-red`, constant test value) already present on the server with
-    no zone, no notification, and no real consumer wired to it — genuinely low-stakes, not
-    anything-wired-to-a-real-alarm.
-  - Verified the same end-to-end proof as Part 2, against the real boat system: committed
-    `{lower: 200, state: alarm}` on `test.test` via the actual Commit mechanism, pushed a WS
-    delta crossing the boundary (250), and got a real `notifications.test.test` delta with
-    `state: alarm` back from the live server. "Get live" and the stored profile both agreed
-    with what was committed.
-  - **Real finding, not something this session introduced:** while checking the stored config
-    after committing on `test.test`, found a SECOND, unexpected entry already present —
-    `electrical.batteries.lifepo4.cellVoltage.1` (a real, actively-monitored LiFePO4 cell
-    voltage path from `signalk-conachair-ble`) — with a stored zone of `{lower: 3, upper: 3.5}`
-    but a *live* `meta.zones` of `{lower: 3, upper: 3}` (a degenerate zone that can never
-    actually match any value, since the test is `value < upper && value >= lower`). The
-    mismatch between stored and live strongly suggests an earlier, apparently-interrupted
-    session got partway into Part 2/3-style direct-meta-write testing against this real battery
-    path instead of a safe synthetic one, before this session's continuation began — the plugin
-    itself wasn't deployed yet when this session started (confirmed: no `~/signalk-alarms/`, no
-    symlink, no `package.json` entry), but its config file and a stray live meta write had
-    already landed. Currently harmless (the degenerate zone can't fire, and the live notification
-    was sitting at `normal`), but real orphaned state on a real battery path, not a hypothetical.
-    **Cleaned up**: cleared `meta.zones` for that path (confirmed `alarmMethod`/`units`/other
-    meta fields were untouched — only `zones` was cleared) and removed it from the stored
-    `Default` profile, backing up the plugin's config file first. Flagging this clearly rather
-    than quietly fixing it and moving on, since it's evidence of a previous session's real,
-    unfinished touch on live boat hardware — worth knowing about even though the immediate
-    effect was benign.
-    **Resolved:** Paddy confirmed this was his own manual testing, not an untracked session
-    touching real hardware — no further concern.
-  - Confirmed `signalk.service` healthy after all of the above: `active (running)`, same PID as
-    right after the restart (no crash/respawn during testing), no new errors in the journal
-    beyond the three already-known pre-existing benign ones (`signalk-notification-player`'s
-    missing-festival message, occasional mDNS `ENETUNREACH`, and version-check `fetch failed` —
-    all present immediately after a clean restart too, unrelated to this plugin). Node-RED and
-    other existing consumers reconnected normally post-restart per the service log.
-- **Multi-zone editing per path; pre-population fixed.** Paddy found two real usability gaps
-  using the deployed Pi webapp itself. Both reproduced directly against the Pi before fixing,
-  per usual practice here:
-  - **"Can only set 1 zone at a time" — confirmed a real single-entry limitation, not a UI
-    glitch.** The old editor had one scalar lower/upper/state triple per row; the backend
-    `commit-zone` route already accepted a full zones array (no backend change needed), but the
-    frontend only ever sent a 1-element array, and `configuration.profiles.Default.zones[path]
-    = cleanZones` (and the matching `meta.zones` write) fully REPLACES rather than merges —
-    confirmed by committing a warn zone then an alarm zone on the same path via the old
-    single-input flow and watching the warn zone vanish. **Fixed:** `draftZones` is now an
-    array; the row shows one lower/upper/state/Remove group per zone, an "Add zone" button
-    appends another, Commit sends the whole array. Verified live on the Pi: committed a warn
-    band (0–50) and a separate alarm band (lower: 50) on `test.test` together, confirmed both
-    persisted in the stored profile AND `meta.zones`, then fed WS deltas (25, then 75) and got
-    the correct `warn` then `alarm` notification for each, a single stable notification id
-    throughout (no double-fire).
-  - **"Live update doesn't seem to work, lower/upper stay blank" — determined which of the two
-    plausible causes it actually was, not assumed.** Reproduced on the Pi: the live *value*
-    readout was working correctly the whole time (watched it tick 3.332 → 3.329 on a real
-    battery path, and 250 → 75 on a WS-driven test path, both live and correct). The actual bug
-    was that the lower/upper/state *editor inputs* always reset to blank/`alarm` on every row
-    expand, regardless of what was already stored for that path — confirmed by expanding
-    `electrical.batteries.lifepo4.cellVoltage.1` (Paddy's own real, already-committed
-    `{alert, 3.3–3.55}` zone) and seeing empty inputs and the hardcoded `alarm` default instead.
-    **Fixed:** row expand now calls `zonesToDraft(defaultProfileZones[path])` to seed the
-    editable list from stored data instead of resetting it blank; re-verified on the same real
-    row afterward — inputs now show `3.3`, `3.55`, `alert` correctly.
-  - Also closes the "Get live" loop flagged in CLAUDE.md's Tab 1 section two sessions ago:
-    clicking it now overwrites the same editable `draftZones` list with the path's actual live
-    `meta.zones` (still uncommitted, still freely overwritable, no confirmation) — not just the
-    read-only bar display it was limited to before. Verified by manually injecting a live-only
-    zone (`{state: emergency, lower: 90}`, distinct from the stored warn/alarm pair) via a raw
-    WS meta delta and confirming "Get live" replaced the draft list with that single row.
-  - **New environment nuance, not a bug:** live browser testing against the Pi required an
-    authenticated session (see the security/auth gotcha from two sessions ago); since I don't
-    have and shouldn't handle Paddy's actual login, I patched `window.fetch`/`WebSocket` in the
-    page's own JS context to attach a `signalk-generate-token`-issued JWT, then called
-    `loadZonesTab()` again to reload through the patched calls — same technique as the
-    SSH-based token approach already documented, just applied inside the browser instead of via
-    curl. This is a testing workaround for driving the deployed UI without a password prompt,
-    not a change to the plugin itself — the plugin still relies on the normal browser session
-    cookie for any real logged-in user, same as before.
-  - Verified: zero browser console messages and zero new `signalk.service` log errors across
-    reproduction, fixing, and re-verification; `signalk.service` stayed on the same PID
-    throughout (no restart needed — `index.js`/backend was untouched, only `public/app.js` and
-    `public/style.css` changed, both static files).
-- **Remove-all-zones validation bug fixed; Get live now persists to stored profile.** Two
-  independent fixes, not entangled at the feature level — kept separate in the writeup below —
-  but see the shared-helper note at the end, which genuinely does touch both.
-  - **Remove-all-zones:** `/commit-zone` used to reject `zones: []` outright ("must be a
-    non-empty array"). Fixed by only requiring `zones` to be an array — the per-zone
-    bound/state validation loop still runs, but over whatever's actually in the (possibly
-    empty) list, so it can't block a genuinely empty submission. An empty commit now writes
-    `meta.zones: []` (core's native watcher treats an empty test list as "everything falls in
-    the implicit normal gap" — confirmed against its source last session, functionally no
-    alarm) and, in the stored profile, **deletes** the path's key entirely rather than storing
-    a stale `[]` — confirmed by checking `GET /config` afterward and seeing no trace of the
-    path, not just that the commit didn't error.
-  - **Get live persists to stored profile:** per the revised "Get live" decision above. New
-    backend route `POST /persist-zone` (body `{path, zones}`) writes straight into
-    `profiles.Default.zones[path]`, never touches `meta` or calls `app.handleMessage`. The
-    frontend's Get Live handler now does two sequential calls: existing `GET /live-meta` (read,
-    unchanged), then this new route with the result (persist). Kept as two small
-    single-responsibility endpoints rather than one combined route, since `GET /live-meta` was
-    already independently verified across three prior sessions and combining would have
-    duplicated that logic for no real benefit.
-  - **Shared-helper question, answered directly (asked to flag this explicitly):** no shared
-    persist helper existed before this session — the profile-merge-and-save logic was inline
-    inside `/commit-zone` only. Extracted it into `persistZonesForPath(path, zones, cb)`, now
-    called by both `/commit-zone`'s persist step and the new `/persist-zone`. Also extracted
-    `normalizeZones()` (shape cleanup only, no rejection) for the same reason. This is also
-    **where the two fixes turned out more entangled than the prompt's framing suggested**: Fix
-    1's core behavior change — an empty array means "delete the key," not "store `[]`" — lives
-    in `persistZonesForPath`, which Fix 2's new route depends on unconditionally. When Get Live
-    finds a path with genuinely no live zones (`meta.zones: null`), it persists `[]`, which
-    hits the exact same delete-key branch. Didn't design it that way on purpose going in; it
-    fell out of extracting the shared helper and turned out to be the correct behavior for both
-    callers, not a coincidence worth re-litigating, but flagging as asked rather than presenting
-    the two fixes as fully independent when one now quietly depends on the other's semantics.
-  - Verified against the actual deployed Pi (not the scratch server): Fix 1 confirmed twice —
-    directly via API (commit a zone, commit `[]`, confirm `meta.zones: []` and no stored key)
-    and through the real UI (Remove button down to zero rows, Commit, same result). Fix 2
-    confirmed via manual live-meta injection (same WS technique as prior sessions): "Get live"
-    on a path with an injected live-only zone updated the stored profile (checked `GET /config`
-    directly, not just the browser), collapsing and re-expanding the row afterward showed the
-    synced data without touching Commit, and clicking "Get live" again with an unsaved draft
-    edit sitting in the inputs correctly discarded that draft in favor of newly-injected live
-    data — while a second, unrelated path's stored data and draft were unaffected throughout.
-  - One real testing hiccup, not a product bug: mid-session, a stale element reference from the
-    `find` browser tool (reused across two re-renders) caused a click meant for `test.test`'s
-    Commit button to land on `test.test2`'s instead — caught immediately by checking server
-    state directly rather than trusting the UI, and worth remembering for future sessions:
-    re-screenshot and re-locate elements after every render that could have changed the DOM,
-    don't reuse refs across renders.
-  - Zero browser console messages, zero new `signalk.service` log errors; `signalk.service`
-    required one restart (backend `index.js` changed this session, unlike the previous
-    session's frontend-only fixes) and came back healthy immediately, same as every prior
-    restart in this project.
-- **Two-state model implemented: draft layer retired, Profile auto-saves, global Refresh and
-  Send-to-server added.** Two independent pieces of work, kept genuinely separate except where
-  noted below.
-  - **Part 1 — auto-saving Profile.** `draftZones`/`zonesToDraft`/`emptyDraftZone` renamed to
-    `editableZones`/`zonesToRows`/`emptyZoneRow` and all "draft" framing removed from
-    comments — there's no draft concept left, `editableZones` is just the on-screen editable
-    view of Profile for whichever row is expanded. Editing (lower/upper text inputs) debounces
-    600ms before calling `POST /persist-zone` (the exact route built last session for "Get
-    live"'s persist step, reused as-is — no new backend route needed for this part); the state
-    dropdown and Remove save immediately, no debounce, since they're discrete actions with no
-    "pause in typing" to wait for. **Debounce choice, stated explicitly as asked:** 600ms —
-    long enough that a normal typing burst (e.g. "123") collapses into one save, short enough
-    that switching rows or hitting Commit right after typing doesn't leave an edit stranded for
-    long. The debounce closure captures `path` and the specific `editableZones` array instance
-    at schedule time rather than reading the mutable module-level variable at fire time — matters
-    because switching rows before a pending timer fires reassigns that variable, and reading it
-    live from inside the timeout would silently apply a stale row's edits to whatever path
-    happens to be expanded when the timer goes off.
-  - Get Live: confirmed still Server → Profile via the same `/persist-zone` call from last
-    session, only variable names/comments changed. Commit: confirmed Profile → Server only,
-    reusing `/commit-zone` unchanged — it does still also re-persist Profile as a side effect
-    of that route, which is a harmless no-op re-save under the auto-save model, not a "save"
-    Commit itself needs to perform.
-  - **Part 2/3 — global Refresh (read-only) and Send-to-server (write, confirmed).** New
-    backend route `GET /live-zones` bulk-fetches every known path's live `meta.zones` in one
-    request, reusing the exact same tree-walk `/values` already does (not `getSelfPath()` once
-    per path) — extended the existing bulk-endpoint *pattern*, not the `/values` route itself,
-    to avoid touching an endpoint other code already depends on for path-type filtering.
-    **Comparison approach, stated explicitly as asked:** order-independent deep equality — each
-    zone reduces to a `state|lower|upper|message` key, two arrays match if they contain the
-    same multiset of keys regardless of order. Handles duplicate identical zone entries
-    correctly (both sides need the same count of that key), though that's an unlikely real
-    case, not something hit in testing.
-  - **Real edge case the comparison surfaced, not obvious going in:** `zoneKey` treats
-    `message` as part of a zone's identity, but the editable-rows conversion functions had
-    never round-tripped `message` at all (there's no UI for it, never asked for one). Under the
-    old draft-based design that only mattered if someone clicked Commit; under auto-save, *any*
-    edit — typing in a different zone's bound, changing a state dropdown — now re-saves the
-    whole row on every change, so a message set by something other than this UI would vanish on
-    the very next keystroke, and Refresh would then show that path as permanently "differs from
-    server" with no way to clear it through the UI. Fixed by carrying `message` through
-    `zonesToRows`/`editableRowsToZones` untouched even with no input for it — flagged here since
-    it's exactly the kind of "didn't cleanly reuse existing helpers" divergence the prompt asked
-    about, though the divergence was in the frontend's row-conversion functions, not in
-    `persistZonesForPath()`/`normalizeZones()` themselves (both reused unchanged).
-  - Send-to-server's confirmation is a custom in-page Confirm/Cancel pair, not a native
-    `confirm()` — chosen partly for UI consistency (nothing else in this app uses native
-    dialogs) and partly because a real native dialog would have blocked the browser-automation
-    tools used to verify it. Zero mismatches: shows "No changes to send." instead of the
-    confirm step, rather than disabling the button pre-emptively off a possibly-stale count.
-  - **Entanglement between the two parts, flagged as asked rather than silently merged:** none
-    at the route/helper level — Part 1 only touches `/persist-zone` (already existing), Part
-    2/3 only add `/live-zones` and frontend comparison logic, `persistZonesForPath()`/
-    `normalizeZones()` untouched by both. The one real link is conceptual: Send-to-server and
-    Commit both remove a path from `mismatchedPaths` on success (so a just-resolved row's badge
-    disappears immediately rather than waiting for the next Refresh), which means Part 2/3's
-    badge state is quietly informed by Part 1/Commit's actions — mentioned since it wasn't
-    asked for outright, it was a small UX addition built on top of already having the
-    information from a single-path operation's own result.
-  - Verified end-to-end, scratch server first then the Pi: typed a lower-bound edit, watched
-    "Saved" appear, confirmed via `GET /config` (not just the browser) that it persisted, then
-    did a full page reload and confirmed the row showed the edited value on re-expand without
-    touching Commit. Manually created a live/Profile mismatch (WS meta injection on a path
-    Profile had nothing for), clicked Refresh, confirmed only that path got the `≠ server`
-    badge (collapsed and expanded) while others didn't. Clicked Send to server, confirmed the
-    count matched, confirmed, then re-ran Refresh and confirmed zero differences remained.
-    Confirmed the zero-mismatch case shows "No changes to send." without a confirm step.
-  - **On the Pi specifically:** found `electrical.batteries.lifepo4.cellVoltage.1` (Paddy's own
-    real, in-progress battery zone editing) and two other real paths
-    (`electrical.other.esp32.vcc`, `propulsion.head.temperature`) genuinely mismatched against
-    Server when Refresh first ran — real pre-existing drift, not something this session
-    introduced. Deliberately did NOT include them in any Send-to-server push, since that would
-    mean deciding on Paddy's behalf that his current Profile values should overwrite whatever's
-    actually alarming on his boat right now. Used Get Live on each instead (pure read from
-    Server, writes nothing to it) to bring Profile back in sync with reality first, then ran
-    the actual Send-to-server test against an isolated `test.test` mismatch only. Cleaned up
-    `test.test` back to empty afterward; left Paddy's three real paths exactly as their own
-    live Server state already had them.
-  - Zero browser console messages, zero new `signalk.service` log errors on either server;
-    `signalk.service` required one restart on the Pi (backend `index.js` changed) and came back
-    healthy immediately, same PID throughout the rest of testing.
-- **Fixed: expanded row's main bar staleness after Commit; added the per-row sync-status
-  indicator.** Two fixes asked for, but reproduction traced them to the same root cause —
-  stated explicitly since the prompt asked directly whether they were related.
-  - **Reproduced Fix 1 before touching code, as asked.** Committing on a row that had never had
-    "Get live" clicked already refreshed the main bar correctly — no bug in that path. The bug
-    only appeared after "Get live" had been clicked at least once on that row: it left `liveZones`
-    (a per-row snapshot the bar preferred over Profile whenever set) non-undefined, and Commit's
-    success handler never reset it, so the bar stayed frozen on the old "Get live" snapshot —
-    confirmed by watching the thumbnail turn correctly while the main bar stayed stuck red, then
-    watching a second "Get live" click "fix" it by re-populating that same stale variable.
-  - **Fix 2 (per-row sync-status indicator) retires that entire `liveZones` branch** — the bar
-    now unconditionally renders `defaultProfileZones[path]`, so Fix 1 falls out of Fix 2
-    automatically rather than needing its own separate patch. `buildSyncStatusBadge(path)` /
-    `fillSyncStatusBadge()` / `updateSyncStatusBadges()` reuse `mismatchedPaths` (the exact Set
-    Refresh already computes) for a 3-state badge (matches/differs/not yet checked) shown via one
-    shared `data-sync-path` attribute on both the thumbnail and the expanded row, updated in
-    place (not a full re-render) so autosave firing mid-typing can't steal focus.
-  - **Leftover old labeling found and removed, as asked to check for:** the toolbar's
-    "LIVE (FROM SERVER)" / "Profile (Default)" text label (a holdover from the pre-two-state-model
-    live-preview design) was still present and still driven by the same stale `liveZones` check —
-    removed entirely, replaced by the sync-status badge in the same toolbar slot.
-  - **Real bug found while wiring the indicator up, not something introduced here:**
-    `saveProfileNow` (autosave) was deleting the just-edited path from `mismatchedPaths` on
-    success — copied from Get Live/Commit's own success handlers, where that's correct (they
-    genuinely sync Profile to Server), but backwards for autosave, which only ever writes
-    Profile and never touches Server. Left uncaught, it would have silently shown a
-    just-edited, never-pushed path as "matches" instead of "differs". Fixed by adding to
-    `mismatchedPaths` instead of deleting from it (only when a Set already exists, i.e. Refresh
-    has run at least once).
-  - Verified end-to-end, scratch server first then the Pi: reproduced the exact stale-bar
-    behavior against the pre-fix code (both the working "never touched Get Live" case and the
-    broken "Get Live then Commit" case) before changing anything. Post-fix: committed on an
-    expanded row and watched the main bar update immediately; loaded the page fresh and
-    confirmed "Not yet checked" on every row, not a false "matches"; ran Refresh and watched a
-    matching and a WS-injected mismatched row badge correctly on both thumbnail and expanded
-    view, live, mid-typing, without a full re-render; resolved the mismatch via Send-to-server
-    and watched the badge flip to "matches" automatically, no second manual Refresh needed.
-  - No backend changes this session (frontend/CSS only) — no `signalk.service` restart needed
-    on either server, just a page reload. Zero browser console messages, zero new log errors on
-    both.
-- **Copy/paste zones between paths; numeric boundary labels on the zone bar.** Two independent
-  additions, no backend changes — both pure frontend, reusing existing routes/mechanisms.
-  - **Copy/paste:** `copiedZones` is a single shared, in-memory JS variable (not the OS
-    clipboard, not persisted — explicitly scoped to the current page load). Copy stores the
-    expanded row's current `editableZones`; Paste (disabled until something's been copied)
-    replaces the target row's `editableZones` with a clone of the copied array, then runs
-    through the exact same `flushPendingAutosave()` + `saveProfileNow()` path any other
-    discrete edit uses — no special-casing needed for Paste to correctly mark the pasted path
-    as "differs from server," since that's already `saveProfileNow`'s job for every caller.
-    Paste deliberately does not Commit — Profile-only, same as typing.
-  - **Boundary labels: main/full bar only, not the thumbnail** — implementation judgment, as
-    the prompt explicitly allowed. The thumbnail is 140×10px, not enough room for legible
-    numeric text even for a single zone's two labels, let alone a multi-zone path; the main bar
-    (28px tall, full row width) has room. A `.zone-bar-labels` row sits under the bar, one
-    label per real (explicitly-set) zone edge — not per the `zLower`/`zUpper` fallback values
-    used for unbounded-edge rendering — positioned at the same x% the color segment uses.
-    Verified live with both a 1-zone path (single "100"/"200" pair) and a 2-zone contiguous
-    path (warn 0–20, alarm 20–30): the shared boundary at 20 renders as one clean, non-
-    overlapping "20", confirming no de-duplication logic was needed.
-  - **Real bug found and fixed, NOT specific to copy/paste despite being caught while testing
-    it:** `saveProfileNow` is async; Paste's (and Remove's, and the state-dropdown's) click
-    handler called `renderZonesList()` synchronously right after triggering the save, which ran
-    before the save's promise resolved and updated `defaultProfileZones[path]` — so the
-    resulting render showed the bar stuck on stale data (e.g. "No zones defined for this path
-    yet." right after a successful paste) even though the input fields (driven by local
-    `editableZones`, mutated synchronously) were already correct, and even though the save
-    itself had genuinely succeeded server-side (confirmed via a direct `GET /config` check
-    during debugging — a rendering/timing bug, not a data-loss bug). **Fixed** by tagging bar
-    wrapper elements with `data-bar-path` and adding an `updateZoneBars(path)` in-place
-    refresher (mirroring the existing `updateSyncStatusBadges`/`updateAutosaveIndicator`
-    pattern), called from inside `saveProfileNow`'s success handler — this fixes the bug for
-    every caller of `saveProfileNow`, not just Paste, since it's the same async-render race any
-    discrete non-debounced edit action was exposed to.
-  - Verified end-to-end, scratch server first then the Pi (`test.test` → copy →
-    `test.test2` → paste, both times using paths with no real consumer): pasted zones appeared
-    correctly in the target row's inputs, bar, and thumbnail immediately, confirmed persisted
-    via a direct `GET /config` call (not just the browser) both times, and Refresh correctly
-    showed both the copy-source and paste-target paths as "≠ server" (neither had been
-    Committed). On the Pi specifically, used `test.test`/`test.test2` — pre-existing,
-    unconsumed scaffold paths, not any of Paddy's real battery/other in-progress zones — and
-    reset both back to empty via `/persist-zone` afterward; neither was ever Committed during
-    this session, so no live `meta.zones` write touched the Pi at all, nothing to clean up
-    there. No backend changes this session, so no `signalk.service` restart needed on either
-    server — confirmed same PID throughout. Zero browser console messages (checked on a fresh
-    page load, not just after the test interactions) and zero new server-log errors on both
-    scratch and the Pi.
+**Zones tab**
+- Path list with text search + source filter (top-level SignalK namespace, derived from the
+  path string). Excludes `notifications.*` (that's Tab 2) and any path whose current value is
+  confirmed non-numeric; a path that's never reported a value stays included.
+- Each row expands accordion-style (one open at a time) to a colored zone bar, a live current-
+  value marker on that bar (a thin white/dark-outlined line, shown only when the current value
+  falls within the bar's own range — omitted, not clamped, otherwise), numeric boundary labels
+  under the bar, and an editable list of zones (lower/upper/state/Remove per zone, "Add zone").
+  Both the bar's boundary labels and the editable list are sorted by lower bound ascending at
+  render time only — storage order is untouched, so this has no effect on the Refresh/Send-to-
+  server diff logic below.
+- **Live unit-conversion display**, via one shared `formatWithUnit(rawValue, units)`: K→°C,
+  rad→°, ratio→%, m/s→kt (e.g. `283 (10.0°C)`). Units come from the path's own `meta.units`
+  (bulk-fetched once at tab load via `GET /units`, not re-fetched per row). Reused for the
+  live-typing hint next to lower/upper inputs, the boundary labels, and the Current Value
+  readout — the last of those additionally rounds the raw value to 2 decimals first (a live
+  streaming value can carry long floating-point noise; boundary labels/typing hints show
+  exactly what's typed/stored, unrounded). Units this doesn't recognize (V, A, m/s already
+  handled, etc.) render unconverted.
+- **Server vs. Profile, exactly as decided above** — auto-saving edits, per-row Get Live/
+  Commit, global Refresh/Send-to-server with per-row sync-status badges (matches/differs/not
+  yet checked), Copy/Paste zones between paths. All implemented and verified per the "Two-state
+  model" section above.
+- Commit writes `meta.zones` via `app.putSelfPath()` (not `app.handleMessage()` — see the
+  gotchas below for why that distinction matters; an earlier version used the latter and the
+  write silently never survived a restart, since `handleMessage()` only publishes into the
+  live data model and never touches disk).
+
+**Notifications tab**
+- Flat, sortable list of path+state→sound bindings (path alphabetically, then state in
+  severity order `alert < warn < alarm < emergency` — reads more sensibly than alphabetical for
+  states specifically). Sound picker is populated from an actual directory listing
+  (`GET /sounds`, backed by `~/.signalk/plugin-config-data/signalk-alarms/sounds/*.wav`), never
+  freehand text, with a manual "Refresh list" affordance since sound files are added by hand.
+  Mode is once/repeat, with an interval field only shown for repeat.
+- Path input **auto-prefixes `notifications.`** on blur if the user doesn't type it, and both
+  `POST /notification-config` and `POST /profiles/:name` reject a notifications key missing
+  that prefix server-side too — closes a real dead-config bug found during a discovery pass (a
+  saved key without the prefix can never match a live delta's actual path, so it silently never
+  fires; the profiles migration below fixes any pre-existing instance of this on startup).
+- Backend subscribes broadly to `notifications.*` via `app.subscriptionmanager` (bootstraps
+  from the delta cache on subscribe, so an alarm already active when the plugin starts is
+  picked up immediately, not missed until its next state change). Plays via
+  `paplay --volume=65536` (matches `pi-deck-tools`' own critical-alert player, confirmed as the
+  proven-working mechanism on this hardware — not `aplay`), through a single serial queue (so
+  simultaneous alarms don't overlap) with a 30s per-play timeout so a hung `paplay` can't jam
+  future alarms. An unconfigured path/state falls back to `defaultSound`, played once — nothing
+  goes unnoticed by design. A duplicate delta at an already-alarming state (no real transition)
+  does not restart playback or reset an in-progress repeat interval.
+
+**Profiles**
+- A profile is `{ zones, notifications, defaultSound }` — a full snapshot spanning both tabs.
+  `activeProfile` names whichever one is currently staged/live; every read/write in both tabs
+  goes through it, not a hardcoded name (see "Data model" above for the full shape and the
+  migration that got existing installs here).
+- Profile bar: dropdown + Save / Save as... / Delete, all wired (previously non-functional
+  stubs). Save overwrites the active profile with current staged state; Save as... prompts
+  inline (a text input + Save/Cancel appended to the bar, matching the same pattern as the
+  Load prompt below — not `window.prompt`) with a live "this will overwrite an existing
+  profile" warning if the typed name collides, Enter/Save submits, Escape/Cancel dismisses,
+  empty/whitespace-only is silently ignored.
+- **Load** (picking a different profile in the dropdown): a real 3-choice inline prompt —
+  Replace everything / Merge (only overwrite paths present in the loaded profile, leave
+  everything else untouched) / Cancel (reverts the dropdown, changes nothing). Either way this
+  only updates staged state and switches `activeProfile` — never touches SignalK directly.
+- **Delete**: rejects deleting the active profile or the last remaining one (backend-enforced,
+  frontend shows the reason inline rather than silently doing nothing); deleting a non-active
+  profile asks for an inline confirm first, same non-native-dialog pattern as everything else
+  here.
+- **Send to server unsaved-changes guard**: before the existing mismatch-count confirm, checks
+  whether currently-staged state deep-equals ANY saved profile (not just the active one — a
+  Merge can produce a combination matching neither source). If it matches none: "Save and
+  send" / "Send without saving" / Cancel. Doesn't change what actually gets pushed.
+
+**Known gotcha from building the delete/Load UI, worth remembering if this area gets touched
+again:** the profile `<select>` gets fully rebuilt on every `renderProfileBar()` call,
+including the one that opens the Load prompt itself — a first pass had that rebuild always
+re-select `activeProfile`, which meant a delete button reading `select.value` could never
+actually see a just-picked, not-yet-loaded (non-active) name. Fixed by having the rebuild
+prefer the pending Load target when one exists. Found only by actually driving the UI in a
+browser, not from code review.
+
+**Deployment**: symlinked at `~/signalk-alarms/` on the Pi per the deploy pattern below,
+`signalk.service` restarts cleanly on every backend change, zero browser console errors or new
+server-log errors across all of the above. `zones-edit`/`@signalk/zones` confirmed installed
+but disabled with empty config — the double-notification risk in the gotchas below is
+theoretical for this boat, not live.
+
+**Open, cosmetic, not blocking anything:**
+- `pathSettings[path].min/max` (a path's editor display range) has no UI yet — the zone bar
+  still auto-fits to the zones' own bounds, a display-only stopgap, not the real per-path scale
+  from "Tab 1 — Zones" above.
+- The zone-state color palette (`nominal`=green, `alert`=yellow, `warn`=orange, `alarm`=red,
+  `emergency`=purple) is a placeholder, not verified against Kip's actual gauge-zone palette.
 
 ## Not yet decided / next session
 
-- Anchor alarm is no longer special-cased for profile auto-switching — it's just one
-  notification path among all the others on Tab 2, same as everything else. Profile
-  switching is manual only for now unless we revisit an auto-switch trigger later.
-- **Live alarm-state "instant glance" dots on thumbnails** — a separate idea from the
-  "Two-state model"'s Refresh/Send-to-server (notification *state*, e.g. reading
-  `notifications.<path>` live, rather than zone *bounds* matching/mismatching). The two-state
-  model itself is now built (see "Current status"), so this is ripe to revisit, but still not
-  decided whether it's wanted alongside or instead of the `≠ server` badge — deliberately not
-  decided this session either, per its own explicit constraints.
+- Profile switching is manual only (via the profile bar) — no auto-switch trigger (e.g. on
+  entering/leaving an anchorage) exists or is planned yet.
+- **Live alarm-state "instant glance" dots on thumbnails** — reading `notifications.<path>`
+  live (notification *state*) rather than zone *bounds* matching/mismatching, as a Zones-tab
+  thumbnail affordance. Not decided whether this is wanted alongside or instead of the
+  `≠ server` sync-status badge.
+- `pathSettings[path].min/max` UI (see above) — genuinely just not built yet, not a design
+  question.

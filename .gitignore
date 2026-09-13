@@ -1,0 +1,13 @@
+node_modules/
+npm-debug.log*
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+
+# Local Claude Code settings -- machine-specific, not shared project config
+.claude/settings.local.json
+
+# Runtime data belongs on the SignalK server (~/.signalk/plugin-config-data/),
+# never in this repo -- defensive in case it's ever symlinked in locally
+plugin-config-data/
