@@ -1,5 +1,5 @@
 # signalk-alarms
-
+# Apart from this line everything in this repo has been created by Claude pro/Claude code. 
 A [Signal K](https://signalk.org/) plugin + webapp for threshold alarms and sound alerts,
 with savable, switchable **profiles** so different situations (anchored, coastal, offshore)
 can each have their own thresholds and sounds — swap between them in one click.
